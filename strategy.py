@@ -12,29 +12,6 @@ def market_regime(df: pd.DataFrame) -> str:
     spread = abs(last["ema_fast"] - last["ema_slow"]) / last["ema_slow"] * 100
     return "TRENDING" if spread > 0.1 else "RANGING"
 
-def _check_early_fire(conds, df, direction):
-    """
-    Returns True if 8/10 or 9/10 conditions pass
-    AND a matching candle pattern confirms the direction.
-    """
-    passed = sum(bool(v) for v in conds)
-    total  = len(conds)
-
-    if passed < total - 2:
-        return False, None
-
-    patterns = detect_candle_patterns(df)
-    for pname, ptype in patterns.items():
-        if direction == Signal.LONG  and ptype == "bullish":
-            return True, pname
-        if direction == Signal.SHORT and ptype == "bearish":
-            return True, pname
-        # Doji only confirms at 9/10
-        if ptype == "neutral" and passed == total - 1:
-            return True, f"{pname} (Doji)"
-
-    return False, None
-
 def generate_signal(df: pd.DataFrame) -> tuple:
     df = compute_all(df)
     if len(df) < 3:
@@ -116,7 +93,7 @@ def generate_signal(df: pd.DataFrame) -> tuple:
         bullish_candle,
     ]
 
-    # ── FULL FIRE (all conditions met) ─────────────────────────────
+    # ── FULL FIRE ONLY (all conditions met - no early fire) ────────
     if all(long_conds):
         return Signal.LONG,  round(price - sl_dist, 5), round(price + tp_dist, 5)
     if all(short_conds):
@@ -124,27 +101,6 @@ def generate_signal(df: pd.DataFrame) -> tuple:
     if all(downtrend_short_conds):
         return Signal.SHORT, round(price + sl_dist, 5), round(price - tp_dist, 5)
     if all(uptrend_long_conds):
-        return Signal.LONG,  round(price - sl_dist, 5), round(price + tp_dist, 5)
-
-    # ── EARLY FIRE (8/10 or 9/10 + candle pattern) ─────────────────
-    fired, pattern = _check_early_fire(long_conds,           df, Signal.LONG)
-    if fired:
-        print(f"[EARLY FIRE] STD LONG  via pattern: {pattern}")
-        return Signal.LONG,  round(price - sl_dist, 5), round(price + tp_dist, 5)
-
-    fired, pattern = _check_early_fire(short_conds,          df, Signal.SHORT)
-    if fired:
-        print(f"[EARLY FIRE] STD SHORT via pattern: {pattern}")
-        return Signal.SHORT, round(price + sl_dist, 5), round(price - tp_dist, 5)
-
-    fired, pattern = _check_early_fire(downtrend_short_conds, df, Signal.SHORT)
-    if fired:
-        print(f"[EARLY FIRE] DT SHORT  via pattern: {pattern}")
-        return Signal.SHORT, round(price + sl_dist, 5), round(price - tp_dist, 5)
-
-    fired, pattern = _check_early_fire(uptrend_long_conds,   df, Signal.LONG)
-    if fired:
-        print(f"[EARLY FIRE] UT LONG   via pattern: {pattern}")
         return Signal.LONG,  round(price - sl_dist, 5), round(price + tp_dist, 5)
 
     return Signal.NONE, 0, 0
