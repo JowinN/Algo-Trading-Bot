@@ -13,19 +13,20 @@ BYBIT_BASE = "https://api.bybit.com/v5/market"
 
 class BacktestEngine:
     """
-    Backtests the algo trading bot on 6 months of historical data.
+    Backtests the algo trading bot on 1 month of historical data.
     """
     
-    def __init__(self, symbols=None, start_date=None, balance=1000):
+    def __init__(self, symbols=None, start_date=None, balance=1000, days=30):
         self.symbols = symbols or c.SYMBOLS
         self.balance = balance
-        self.start_date = start_date or (datetime.now() - timedelta(days=180))
+        self.days = days
+        self.start_date = start_date or (datetime.now() - timedelta(days=days))
         self.trades = []
         self.equity_curve = []
         
-    def fetch_historical_data(self, symbol, interval="15m", days=180):
+    def fetch_historical_data(self, symbol, interval="15m", days=30):
         """
-        Fetch 6 months of historical 15m candles from Bybit.
+        Fetch 1 month of historical 15m candles from Bybit.
         Returns dataframe sorted by timestamp.
         """
         bybit_interval = INTERVAL_MAP.get(interval, "15")
@@ -34,7 +35,7 @@ class BacktestEngine:
         
         # Bybit API limits to ~200 candles per request
         # We need to fetch multiple batches
-        while len(all_candles) < (days * 24 * 60 // 15):  # 15m candles in 6 months
+        while len(all_candles) < (days * 24 * 60 // 15):  # 15m candles in 1 month
             try:
                 url = f"{BYBIT_BASE}/kline"
                 params = {
@@ -62,7 +63,7 @@ class BacktestEngine:
                 oldest_timestamp = float(candles[-1][0])
                 current_date = datetime.fromtimestamp(oldest_timestamp / 1000)
                 
-                # Stop if we've gone back 180+ days
+                # Stop if we've gone back days+ days
                 if (datetime.now() - current_date).days >= days:
                     break
                     
@@ -83,10 +84,10 @@ class BacktestEngine:
     
     def run_backtest(self):
         """
-        Simulate the bot trading across 6 months of data.
+        Simulate the bot trading across 1 month of data.
         """
         print(f"\n{'='*70}")
-        print(f"  BACKTESTING ALGO BOT — 6 MONTHS")
+        print(f"  BACKTESTING ALGO BOT — {self.days} DAYS")
         print(f"  Start Balance: ${self.balance:.2f}")
         print(f"  Symbols: {len(self.symbols)}")
         print(f"{'='*70}\n")
@@ -94,10 +95,10 @@ class BacktestEngine:
         # Fetch data for all symbols
         print("📥 Fetching historical data from Bybit...")
         all_data = {}
-        for symbol in self.symbols[:5]:  # Start with first 5 for speed
+        for symbol in self.symbols:
             print(f"   {symbol}...", end=" ", flush=True)
             try:
-                df = self.fetch_historical_data(symbol, days=180)
+                df = self.fetch_historical_data(symbol, days=self.days)
                 all_data[symbol] = df
                 print(f"✓ ({len(df)} candles)")
             except Exception as e:
@@ -124,6 +125,7 @@ class BacktestEngine:
         open_position = None  # { symbol, entry_price, qty, sl, tp, entry_time }
         daily_pnl = 0.0
         last_daily_reset = min_date.date()
+        last_trade_time = None
         
         # Get all unique timestamps across all symbols
         all_timestamps = sorted(set([ts for df in all_data.values() for ts in df["timestamp"]]))
@@ -135,6 +137,10 @@ class BacktestEngine:
             if current_date != last_daily_reset:
                 daily_pnl = 0.0
                 last_daily_reset = current_date
+            
+            # ── Daily loss guard ───────────────────────────────────────
+            if not self._daily_limit_ok(daily_pnl, current_balance):
+                continue
             
             # ── Close position if SL/TP hit ───────────────────────────
             if open_position:
@@ -196,10 +202,17 @@ class BacktestEngine:
                           f"P&L: ${pnl:+.2f} ({exit_reason})")
                     
                     open_position = None
+                    last_trade_time = ts
             
             # ── Check for new entries ──────────────────────────────────
             if open_position is None:
-                for symbol in self.symbols[:5]:  # Test first 5 symbols
+                # Check minimum candles between trades (cooldown)
+                if last_trade_time is not None:
+                    candles_since = len([t for df in all_data.values() if (t > last_trade_time) and (t <= ts) for t in df["timestamp"]])
+                    if candles_since < c.MIN_CANDLES_SINCE_TRADE:
+                        continue
+                
+                for symbol in self.symbols:
                     if symbol not in all_data:
                         continue
                     
@@ -213,8 +226,8 @@ class BacktestEngine:
                     if idx < 50:  # Need at least 50 candles for indicators
                         continue
                     
-                    # Get last 50 candles up to this point
-                    hist_df = df.iloc[max(0, idx-50):idx+1].copy()
+                    # Get last 100 candles up to this point (better for 200 EMA)
+                    hist_df = df.iloc[max(0, idx-100):idx+1].copy()
                     
                     try:
                         # Compute indicators and generate signal
@@ -243,7 +256,7 @@ class BacktestEngine:
                                 }
                                 
                                 print(f"[{ts}] 🟢 OPENED {symbol} {signal} | "
-                                      f"Price: ${entry_price:.5f} | Qty: {int(qty)} | "
+                                      f"Price: ${entry_price:.5f} | Qty: {qty:.2f} | "
                                       f"SL: ${sl:.5f} | TP: ${tp:.5f} | Lev: {lev}x")
                                 break  # Only 1 position at a time
                     
@@ -277,6 +290,12 @@ class BacktestEngine:
         
         self.print_results(current_balance, self.balance)
     
+    def _daily_limit_ok(self, daily_pnl: float, balance: float) -> bool:
+        """Check daily loss limit"""
+        if balance == 0:
+            return True
+        return (daily_pnl / balance) > -c.DAILY_LOSS_LIMIT
+    
     def print_results(self, final_balance, initial_balance):
         """
         Print backtest summary statistics.
@@ -296,15 +315,14 @@ class BacktestEngine:
         win_rate = (len(winning_trades) / len(df_trades)) * 100 if len(df_trades) > 0 else 0
         avg_win = winning_trades["pnl"].mean() if len(winning_trades) > 0 else 0
         avg_loss = abs(losing_trades["pnl"].mean()) if len(losing_trades) > 0 else 0
-        
-        profit_factor = (winning_trades["pnl"].sum() / abs(losing_trades["pnl"].sum())) if len(losing_trades) > 0 else 0
+        profit_factor = (winning_trades["pnl"].sum() / abs(losing_trades["pnl"].sum())) if len(losing_trades) > 0 and losing_trades["pnl"].sum() != 0 else 0
         
         equity_df = pd.DataFrame(self.equity_curve)
         max_balance = equity_df["balance"].max()
         max_drawdown = ((max_balance - equity_df["balance"].min()) / max_balance) * 100 if max_balance > 0 else 0
         
         print(f"\n{'='*70}")
-        print(f"  BACKTEST RESULTS")
+        print(f"  BACKTEST RESULTS — {self.days} DAYS")
         print(f"{'='*70}")
         print(f"  Initial Balance:     ${initial_balance:.2f}")
         print(f"  Final Balance:       ${final_balance:.2f}")
@@ -315,13 +333,13 @@ class BacktestEngine:
         print(f"  Losing Trades:       {len(losing_trades)} ({100-win_rate:.1f}%)")
         print(f"\n  Avg Win:             ${avg_win:+.2f}")
         print(f"  Avg Loss:            ${avg_loss:+.2f}")
-        print(f"  Profit Factor:       {profit_factor:.2f} (>1.0 is profitable)")
+        print(f"  Profit Factor:       {profit_factor:.2f} (>1.5 is excellent)")
         print(f"  Max Drawdown:        {max_drawdown:.2f}%")
         print(f"{'='*70}\n")
         
         # Show trades table
-        print("📋 Top 10 Trades:")
-        print(df_trades[["symbol", "direction", "entry_price", "exit_price", "pnl", "pnl_pct", "reason"]].head(10).to_string())
+        print("📋 All Trades:")
+        print(df_trades[["symbol", "direction", "entry_price", "exit_price", "pnl", "pnl_pct", "reason"]].to_string())
         
         # Save results to CSV
         df_trades.to_csv("backtest_trades.csv", index=False)
@@ -329,5 +347,6 @@ class BacktestEngine:
         print("\n✅ Results saved to backtest_trades.csv and backtest_equity_curve.csv")
 
 if __name__ == "__main__":
-    backtester = BacktestEngine(balance=1000)
+    # Run 30-day backtest
+    backtester = BacktestEngine(balance=1000, days=30)
     backtester.run_backtest()
