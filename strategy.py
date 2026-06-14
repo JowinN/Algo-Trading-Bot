@@ -57,31 +57,6 @@ def generate_signal(df: pd.DataFrame) -> tuple:
         pullback_long or breakout_up,
     ]
 
-    # ── SIGNAL B: STANDARD SHORT ───────────────────────────────────
-    short_conds = [
-        curr["ema_fast"] < curr["ema_med"],
-        curr["ema_med"]  < curr["ema_slow"],
-        c.RSI_OVERSOLD < curr["rsi"] < c.RSI_OVERBOUGHT,
-        curr["macd_hist"] < 0,
-        curr["close"] < curr["bb_mid"],
-        curr["volume"] > curr["vol_ma"],
-        bearish_candle,
-        rsi_falling,
-        macd_growing_dn,
-        pullback_short or breakout_dn,
-    ]
-
-    # ── SIGNAL C: DOWNTREND SHORT ──────────────────────────────────
-    downtrend_short_conds = [
-        curr["ema_fast"] < curr["ema_med"],
-        curr["ema_med"]  < curr["ema_slow"],
-        c.RSI_EXTREME_LOW < curr["rsi"] < c.RSI_OVERSOLD,
-        curr["macd_hist"] < 0,
-        curr["close"] < curr["bb_mid"],
-        macd_growing_dn,
-        bearish_candle,
-    ]
-
     # ── SIGNAL D: UPTREND LONG ─────────────────────────────────────
     uptrend_long_conds = [
         curr["ema_fast"] > curr["ema_med"],
@@ -93,13 +68,10 @@ def generate_signal(df: pd.DataFrame) -> tuple:
         bullish_candle,
     ]
 
-    # ── FULL FIRE ONLY (all conditions met - no early fire) ────────
+    # ── FULL FIRE ONLY - LONGS ONLY (testing) ──────────────────────
+    # SHORT signals disabled to diagnose profitability
     if all(long_conds):
         return Signal.LONG,  round(price - sl_dist, 5), round(price + tp_dist, 5)
-    if all(short_conds):
-        return Signal.SHORT, round(price + sl_dist, 5), round(price - tp_dist, 5)
-    if all(downtrend_short_conds):
-        return Signal.SHORT, round(price + sl_dist, 5), round(price - tp_dist, 5)
     if all(uptrend_long_conds):
         return Signal.LONG,  round(price - sl_dist, 5), round(price + tp_dist, 5)
 
