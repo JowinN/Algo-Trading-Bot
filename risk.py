@@ -2,41 +2,56 @@ from config import Config as c
 
 def position_size(balance: float, price: float, sl_price: float, symbol: str = None) -> float:
     """
-    Fixed-fractional sizing with minimum notional enforcement.
-    Returns quantity rounded to nearest QTY_STEP multiple.
+    Conservative position sizing with improved risk management.
+    - Uses fixed-fractional method
+    - Enforces minimum notional
+    - Respects leverage limits
     """
+    if price == 0 or sl_price == 0:
+        return 0.0
+    
+    # Risk amount based on balance
     risk_usdt = balance * c.RISK_PER_TRADE
-    sl_pct    = abs(price - sl_price) / price
-
+    
+    # Distance to stop loss in price
+    sl_pct = abs(price - sl_price) / price
+    
     if sl_pct == 0:
         return 0.0
 
+    # Position size based on risk
     position_usdt = risk_usdt / sl_pct
 
-    # Enforce Mudrex minimum notional ($5 USDT)
-    position_usdt = max(position_usdt, c.MIN_NOTIONAL)
-
-    # Can't spend more than we have (with leverage)
-    max_usdt      = balance * c.SYMBOL_LEVERAGE.get(symbol, c.LEVERAGE)
+    # Apply leverage limit
+    max_usdt = balance * c.SYMBOL_LEVERAGE.get(symbol, c.LEVERAGE)
     position_usdt = min(position_usdt, max_usdt)
 
+    # Enforce minimum notional ($10 USDT minimum)
+    position_usdt = max(position_usdt, c.MIN_NOTIONAL)
+
+    # Calculate raw quantity
     raw_qty = position_usdt / price
 
-    # ← Use per-symbol step if available, else fallback
+    # Get step size for symbol
     step = c.QTY_STEPS.get(symbol, c.QTY_STEP) if symbol else c.QTY_STEP
 
     # Round DOWN to nearest step
     qty = (raw_qty // step) * step
 
-    # Must be at least one step
+    # Ensure at least one step
     qty = max(qty, step)
 
-    # If rounding down put us below min notional, round UP one step
+    # If rounding down violated min notional, round up
     if qty * price < c.MIN_NOTIONAL:
         qty += step
 
     return float(qty)
 
 def daily_limit_ok(daily_pnl: float, balance: float) -> bool:
-    """Returns False when daily loss exceeds the configured limit"""
+    """
+    Check if daily loss hasn't exceeded limit.
+    Returns False when daily loss >= configured limit.
+    """
+    if balance == 0:
+        return True
     return (daily_pnl / balance) > -c.DAILY_LOSS_LIMIT
