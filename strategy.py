@@ -1,175 +1,179 @@
-import pandas as pd
-from indicators import compute_all
-from config import Config as c
+﻿"""
+STRATEGY V10 - 4H Momentum Continuation
+======================================
+Catch multi-day trends. Hold 1-3 days. Fewer filters, more trades, bigger wins.
+
+Architecture:
+- PRIMARY: 4H candles
+- HTF: Daily trend bias (EMA21 vs EMA50)
+- ENTRY: Price near EMA21 in established trend + momentum resumption
+- SL: 2.0 ATR on 4H (wide enough for intraday noise)
+- TP: 3.5R (multi-day target)
+- HOLD: 1-3 days typical
+
+Key changes from V9:
+- Removed VWAP filter (meaningless on 4H rolling)
+- Removed DI+/DI- filter (redundant with ADX + HTF)
+- Removed EMA21 slope requirement (kills pullbacks)
+- Removed strict MACD > 0 (kills pullback entries)
+- Relaxed price vs EMA21 to allow actual pullbacks
+- Lowered ADX threshold to 20
+- Simplified to 5 core conditions: Trend + Pullback Zone + Momentum Resumption + Body + RSI
+
+Math: 35% WR at 3.5R = PF 1.88
+      30% WR at 3.5R = PF 1.50
+      40% WR at 3.5R = PF 2.33
+"""
+
+import numpy as np
+
 
 class Signal:
-    LONG  = "LONG"
+    LONG = "LONG"
     SHORT = "SHORT"
-    NONE  = "NONE"
+    NONE = "NONE"
 
-def market_regime(df: pd.DataFrame) -> str:
-    """
-    Determines if market is TRENDING or RANGING.
-    More robust: uses multiple timeframes and EMA separation.
-    """
-    if len(df) < 50:
-        return "RANGING"
-    
-    last = df.iloc[-1]
-    
-    # EMA separation (tight trend = strong trend)
-    ema_fast = last["ema_fast"]
-    ema_med = last["ema_med"]
-    ema_slow = last["ema_slow"]
-    ema_trend = last["ema_trend"]
-    
-    fast_med_pct = abs(ema_fast - ema_med) / ema_med * 100 if ema_med != 0 else 0
-    med_slow_pct = abs(ema_med - ema_slow) / ema_slow * 100 if ema_slow != 0 else 0
-    slow_trend_pct = abs(ema_slow - ema_trend) / ema_trend * 100 if ema_trend != 0 else 0
-    
-    # TRENDING: all EMAs aligned, good separation
-    if (fast_med_pct > c.MIN_EMA_SPREAD and 
-        med_slow_pct > c.MIN_EMA_SPREAD and
-        slow_trend_pct > 0.05):
-        return "TRENDING"
-    
-    return "RANGING"
 
-def is_strong_uptrend(df: pd.DataFrame) -> bool:
+def generate_signal(df, htf_bias=None):
     """
-    Confirms strong uptrend: fast > med > slow > 200ema, with good separation.
+    4H Momentum Continuation:
+    - Established trend (EMA21 > EMA50 + ADX >= 20)
+    - Price in pullback zone (within 2.5 ATR of EMA21)
+    - Momentum resuming (MACD hist improving OR squeeze fire OR volume surge)
+    - Confirmation candle (some body in direction)
+    - RSI not extreme
     """
-    if len(df) < 50:
-        return False
-    
-    last = df.iloc[-1]
-    ema_fast = last["ema_fast"]
-    ema_med = last["ema_med"]
-    ema_slow = last["ema_slow"]
-    ema_trend = last["ema_trend"]
-    
-    return (
-        ema_fast > ema_med > ema_slow > ema_trend and
-        (ema_fast - ema_med) / ema_med * 100 > c.MIN_EMA_SPREAD and
-        (ema_med - ema_slow) / ema_slow * 100 > c.MIN_EMA_SPREAD
-    )
-
-def is_strong_downtrend(df: pd.DataFrame) -> bool:
-    """
-    Confirms strong downtrend: fast < med < slow < 200ema, with good separation.
-    """
-    if len(df) < 50:
-        return False
-    
-    last = df.iloc[-1]
-    ema_fast = last["ema_fast"]
-    ema_med = last["ema_med"]
-    ema_slow = last["ema_slow"]
-    ema_trend = last["ema_trend"]
-    
-    return (
-        ema_fast < ema_med < ema_slow < ema_trend and
-        (ema_med - ema_fast) / ema_fast * 100 > c.MIN_EMA_SPREAD and
-        (ema_slow - ema_med) / ema_med * 100 > c.MIN_EMA_SPREAD
-    )
-
-def is_price_near_ema_support(close: float, ema_fast: float, ema_med: float) -> bool:
-    """
-    Check if price is near EMAs (pullback) - good entry for LONG.
-    """
-    support_range = (ema_med - ema_fast) * 0.5
-    return close > ema_fast - support_range and close < ema_med + support_range
-
-def is_price_near_ema_resistance(close: float, ema_fast: float, ema_med: float) -> bool:
-    """
-    Check if price is near EMAs (pullback) - good entry for SHORT.
-    """
-    resistance_range = (ema_med - ema_fast) * 0.5
-    return close < ema_fast + resistance_range and close > ema_med - resistance_range
-
-def generate_signal(df: pd.DataFrame) -> tuple:
-    """
-    Advanced signal generation with:
-    - Trend confirmation via multiple EMAs
-    - Volume confirmation
-    - MACD acceleration
-    - RSI momentum
-    - Support/resistance levels
-    """
-    df = compute_all(df)
     if len(df) < 50:
         return Signal.NONE, 0, 0
 
     curr = df.iloc[-1]
     prev = df.iloc[-2]
-    prev2 = df.iloc[-3]
-    price = curr["close"]
-    atr_v = curr["atr"]
 
-    # ── MARKET REGIME CHECK ────────────────────────────────────────
-    regime = market_regime(df)
-    if regime == "RANGING":
+    price = float(curr["close"])
+    open_price = float(curr["open"])
+    atr_val = float(curr["atr"])
+
+    if atr_val <= 0:
         return Signal.NONE, 0, 0
 
-    sl_dist = atr_v * c.SL_ATR_MULT
-    tp_dist = atr_v * c.TP_ATR_MULT
+    # Core indicators
+    ema21 = float(curr["ema21"])
+    ema50 = float(curr["ema50"])
+    adx = float(curr["adx"])
+    rsi_val = float(curr["rsi"])
+    macd_hist = float(curr["macd_hist"])
+    macd_hist_prev = float(prev["macd_hist"])
+    rel_vol = float(curr["rel_volume"])
 
-    # ── CANDLE HELPERS ────────────────────────────────────────────
-    bullish_candle = curr["close"] > curr["open"]
-    bearish_candle = curr["close"] < curr["open"]
-    
-    # Volume confirmation
-    volume_strong = curr["volume"] > curr["vol_ma"] * c.VOLUME_MIN
-    
-    # MACD momentum (stronger threshold)
-    macd_hist = curr["macd_hist"]
-    macd_hist_prev = prev["macd_hist"]
-    macd_hist_prev2 = prev2["macd_hist"]
-    macd_up_momentum = macd_hist > macd_hist_prev > macd_hist_prev2
-    macd_dn_momentum = macd_hist < macd_hist_prev < macd_hist_prev2
-    
-    # RSI momentum
-    rsi_curr = curr["rsi"]
-    rsi_prev = prev["rsi"]
-    rsi_moving_up = rsi_curr > rsi_prev
-    rsi_moving_dn = rsi_curr < rsi_prev
+    # Candle analysis
+    body_pct = float(curr["body_pct"]) if curr["body_pct"] == curr["body_pct"] else 0
+    candle_bullish = price > open_price
+    candle_bearish = price < open_price
 
-    # Recent highs/lows
-    recent_high = df["high"].iloc[-c.PULLBACK_LOOKBACK:-1].max()
-    recent_low = df["low"].iloc[-c.PULLBACK_LOOKBACK:-1].min()
-    recent_range = recent_high - recent_low
-    
-    # Breakout: price broke above/below recent range
-    breakout_strength = (price - recent_low) / recent_range if recent_range > 0 else 0
-    strong_breakout_up = breakout_strength > c.BREAKOUT_STRENGTH
-    strong_breakout_dn = breakout_strength < (1 - c.BREAKOUT_STRENGTH)
+    # Squeeze fire (volatility expansion after compression)
+    squeeze_fire = bool(curr.get("squeeze_fire", False))
 
-    # ── SIGNAL A: STRONG UPTREND LONG ─────────────────────────────
-    uptrend_long = (
-        is_strong_uptrend(df) and
-        curr["close"] > curr["ema_fast"] and
-        rsi_curr > 40 and rsi_curr < 70 and  # RSI sweet spot
-        macd_up_momentum and
-        volume_strong and
-        bullish_candle and
-        (strong_breakout_up or is_price_near_ema_support(price, curr["ema_fast"], curr["ema_med"]))
-    )
+    # ═══════════════════════════════════════════════════════════════
+    # FILTER 1: ADX — trend must have some strength
+    # ═══════════════════════════════════════════════════════════════
+    if adx < 20:
+        return Signal.NONE, 0, 0
 
-    if uptrend_long:
-        return Signal.LONG, round(price - sl_dist, 5), round(price + tp_dist, 5)
+    # ═══════════════════════════════════════════════════════════════
+    # LONG SETUP
+    # ═══════════════════════════════════════════════════════════════
+    if htf_bias == "LONG" or (htf_bias is None and ema21 > ema50):
 
-    # ── SIGNAL B: STRONG DOWNTREND SHORT ───────────────────────────
-    downtrend_short = (
-        is_strong_downtrend(df) and
-        curr["close"] < curr["ema_fast"] and
-        rsi_curr < 60 and rsi_curr > 30 and  # RSI sweet spot
-        macd_dn_momentum and
-        volume_strong and
-        bearish_candle and
-        (strong_breakout_dn or is_price_near_ema_resistance(price, curr["ema_fast"], curr["ema_med"]))
-    )
+        # ── TREND: EMA21 above EMA50 ──────────────────────────────
+        if ema21 <= ema50:
+            return Signal.NONE, 0, 0
 
-    if downtrend_short:
-        return Signal.SHORT, round(price + sl_dist, 5), round(price - tp_dist, 5)
+        # ── PULLBACK ZONE: price within -0.5 to +2.5 ATR of EMA21 ─
+        dist_from_ema21 = (price - ema21) / atr_val
+        if dist_from_ema21 > 2.5 or dist_from_ema21 < -0.5:
+            return Signal.NONE, 0, 0
+
+        # ── CONFIRMATION CANDLE: bullish with some body ───────────
+        if not candle_bullish:
+            return Signal.NONE, 0, 0
+        if body_pct < 0.15:
+            return Signal.NONE, 0, 0
+
+        # ── RSI: not overbought, not deeply oversold ──────────────
+        if rsi_val > 75 or rsi_val < 28:
+            return Signal.NONE, 0, 0
+
+        # ── MOMENTUM RESUMPTION (any one of these) ────────────────
+        macd_improving = macd_hist > macd_hist_prev
+        vol_surge = rel_vol > 1.2
+        squeeze_released = squeeze_fire
+        if not (macd_improving or vol_surge or squeeze_released):
+            return Signal.NONE, 0, 0
+
+        sl, tp = _calculate_levels(Signal.LONG, price, atr_val, df)
+        return Signal.LONG, sl, tp
+
+    # ═══════════════════════════════════════════════════════════════
+    # SHORT SETUP
+    # ═══════════════════════════════════════════════════════════════
+    elif htf_bias == "SHORT" or (htf_bias is None and ema21 < ema50):
+
+        # ── TREND: EMA21 below EMA50 ─────────────────────────────
+        if ema21 >= ema50:
+            return Signal.NONE, 0, 0
+
+        # ── PULLBACK ZONE: price within -0.5 to +2.5 ATR of EMA21 ─
+        dist_from_ema21 = (ema21 - price) / atr_val
+        if dist_from_ema21 > 2.5 or dist_from_ema21 < -0.5:
+            return Signal.NONE, 0, 0
+
+        # ── CONFIRMATION CANDLE: bearish with some body ───────────
+        if not candle_bearish:
+            return Signal.NONE, 0, 0
+        if body_pct < 0.15:
+            return Signal.NONE, 0, 0
+
+        # ── RSI: not oversold, not deeply overbought ──────────────
+        if rsi_val < 25 or rsi_val > 72:
+            return Signal.NONE, 0, 0
+
+        # ── MOMENTUM RESUMPTION (any one of these) ────────────────
+        macd_improving = macd_hist < macd_hist_prev
+        vol_surge = rel_vol > 1.2
+        squeeze_released = squeeze_fire
+        if not (macd_improving or vol_surge or squeeze_released):
+            return Signal.NONE, 0, 0
+
+        sl, tp = _calculate_levels(Signal.SHORT, price, atr_val, df)
+        return Signal.SHORT, sl, tp
 
     return Signal.NONE, 0, 0
+
+
+def _calculate_levels(signal, price, atr_val, df):
+    """
+    4H SL/TP levels:
+    SL: 2.0 ATR (wide — beyond intraday noise on 4H)
+    TP: 3.5R (7.0 ATR — multi-day target)
+
+    Structure-adjusted: Uses swing points when available.
+    """
+    sl_dist = atr_val * 2.0
+
+    if signal == Signal.LONG:
+        swing_low = float(df.iloc[-1]["swing_low"])
+        struct_dist = price - swing_low
+        # Use structure if between 1.2 and 2.5 ATR
+        if 1.2 * atr_val <= struct_dist <= 2.5 * atr_val:
+            sl_dist = struct_dist + atr_val * 0.1  # Small buffer
+        sl = price - sl_dist
+        tp = price + sl_dist * 3.5  # 3.5:1 R:R
+    else:
+        swing_high = float(df.iloc[-1]["swing_high"])
+        struct_dist = swing_high - price
+        if 1.2 * atr_val <= struct_dist <= 2.5 * atr_val:
+            sl_dist = struct_dist + atr_val * 0.1
+        sl = price + sl_dist
+        tp = price - sl_dist * 3.5  # 3.5:1 R:R
+
+    return sl, tp

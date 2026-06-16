@@ -8,12 +8,18 @@ from mudrex import TradeClient
 
 from config     import Config as c
 from data       import get_ohlcv, get_current_price
-from indicators import compute_all, detect_candle_patterns
+from indicators import compute_all, ema
+from ml_model   import MLFilter, extract_features_extended
+from strategy   import Signal
 
 load_dotenv()
 
 app    = Flask(__name__)
 client = TradeClient(api_secret=os.getenv("MUDREX_API_SECRET"))
+
+# Load ML model for scoring
+ml_filter = MLFilter()
+ml_filter.load()
 
 state = {
     "balance"      : 0.0,
@@ -44,15 +50,6 @@ def fetch_position():
     except:
         return []
 
-PATTERN_PRIORITY = [
-    "Three White Soldiers", "Three Black Crows",
-    "Morning Star",         "Evening Star",
-    "Bullish Engulfing",    "Bearish Engulfing",
-    "Pinbar Bullish",       "Pinbar Bearish",
-    "Hammer",               "Shooting Star",
-    "Inverted Hammer",      "Doji",
-]
-
 def fetch_indicators():
     results = []
     for symbol in c.SYMBOLS:
@@ -61,100 +58,133 @@ def fetch_indicators():
             df    = compute_all(df)
             curr  = df.iloc[-1]
             prev  = df.iloc[-2]
-            prev2 = df.iloc[-3]
             price = get_current_price(symbol)
 
-            spread = abs(curr["ema_fast"] - curr["ema_slow"]) / curr["ema_slow"] * 100
-            regime = "TREND" if spread > 0.1 else "RANGE"
+            atr_val = float(curr["atr"])
+            ema21   = float(curr["ema21"])
+            ema50   = float(curr["ema50"])
+            adx     = float(curr["adx"])
+            rsi_val = float(curr["rsi"])
+            macd_hist = float(curr["macd_hist"])
+            macd_hist_prev = float(prev["macd_hist"])
+            rel_vol = float(curr["rel_volume"])
+            body_pct = float(curr["body_pct"]) if curr["body_pct"] == curr["body_pct"] else 0
+            squeeze_fire = bool(curr.get("squeeze_fire", False))
+            candle_bullish = float(curr["close"]) > float(curr["open"])
+            candle_bearish = float(curr["close"]) < float(curr["open"])
 
-            bullish_candle  = bool(curr["close"] > curr["open"])
-            bearish_candle  = bool(curr["close"] < curr["open"])
-            pullback_long   = bool(prev["close"] < prev["open"] and bullish_candle)
-            pullback_short  = bool(prev["close"] > prev["open"] and bearish_candle)
-            macd_growing_up = bool(curr["macd_hist"] > prev["macd_hist"] > prev2["macd_hist"])
-            macd_growing_dn = bool(curr["macd_hist"] < prev["macd_hist"] < prev2["macd_hist"])
-            rsi_rising      = bool(curr["rsi"] > prev["rsi"])
-            rsi_falling     = bool(curr["rsi"] < prev["rsi"])
-            recent_high     = float(df["high"].iloc[-6:-1].max())
-            recent_low      = float(df["low"].iloc[-6:-1].min())
-            breakout_up     = bool(curr["close"] > recent_high)
-            breakout_dn     = bool(curr["close"] < recent_low)
+            # HTF Bias
+            htf_bias = None
+            try:
+                htf_df = get_ohlcv(symbol, c.HTF_TF, limit=60)
+                if htf_df is not None and len(htf_df) >= 50:
+                    htf_df["ema21"] = ema(htf_df["close"], 21)
+                    htf_df["ema50"] = ema(htf_df["close"], 50)
+                    last_htf = htf_df.iloc[-1]
+                    htf_close = float(last_htf["close"])
+                    htf_ema21 = float(last_htf["ema21"])
+                    htf_ema50 = float(last_htf["ema50"])
+                    if (htf_ema21 > htf_ema50 and htf_close > htf_ema21) or \
+                       (htf_close > htf_ema21 and htf_close > htf_ema50):
+                        htf_bias = "LONG"
+                    elif (htf_ema21 < htf_ema50 and htf_close < htf_ema21) or \
+                         (htf_close < htf_ema21 and htf_close < htf_ema50):
+                        htf_bias = "SHORT"
+            except:
+                pass
 
-            signals = {
-                "A: STD LONG": [
-                    curr["ema_fast"] > curr["ema_med"],
-                    curr["ema_med"]  > curr["ema_slow"],
-                    c.RSI_OVERSOLD < curr["rsi"] < c.RSI_OVERBOUGHT,
-                    curr["macd_hist"] > 0,
-                    curr["close"] > curr["bb_mid"],
-                    curr["volume"] > curr["vol_ma"],
-                    bullish_candle,
-                    rsi_rising,
-                    macd_growing_up,
-                    pullback_long or breakout_up,
-                ],
-                "B: STD SHORT": [
-                    curr["ema_fast"] < curr["ema_med"],
-                    curr["ema_med"]  < curr["ema_slow"],
-                    c.RSI_OVERSOLD < curr["rsi"] < c.RSI_OVERBOUGHT,
-                    curr["macd_hist"] < 0,
-                    curr["close"] < curr["bb_mid"],
-                    curr["volume"] > curr["vol_ma"],
-                    bearish_candle,
-                    rsi_falling,
-                    macd_growing_dn,
-                    pullback_short or breakout_dn,
-                ],
-                "C: DT SHORT": [
-                    curr["ema_fast"] < curr["ema_med"],
-                    curr["ema_med"]  < curr["ema_slow"],
-                    c.RSI_EXTREME_LOW < curr["rsi"] < c.RSI_OVERSOLD,
-                    curr["macd_hist"] < 0,
-                    curr["close"] < curr["bb_mid"],
-                    macd_growing_dn,
-                    bearish_candle,
-                ],
-                "D: UT LONG": [
-                    curr["ema_fast"] > curr["ema_med"],
-                    curr["ema_med"]  > curr["ema_slow"],
-                    c.RSI_OVERBOUGHT < curr["rsi"] < c.RSI_EXTREME_HIGH,
-                    curr["macd_hist"] > 0,
-                    curr["close"] > curr["bb_mid"],
-                    macd_growing_up,
-                    bullish_candle,
-                ],
+            # V10 Strategy Conditions (LONG)
+            dist_from_ema21 = (price - ema21) / atr_val if atr_val > 0 else 0
+            macd_improving = macd_hist > macd_hist_prev
+            vol_surge = rel_vol > 1.2
+            momentum_ok = macd_improving or vol_surge or squeeze_fire
+
+            long_conditions = {
+                "Trend (E21>E50)": ema21 > ema50,
+                "ADX ≥ 20": adx >= 20,
+                "Pullback Zone": -0.5 <= dist_from_ema21 <= 2.5,
+                "Bullish Candle": candle_bullish,
+                "Body > 15%": body_pct >= 0.15,
+                "RSI OK (28-75)": 28 <= rsi_val <= 75,
+                "Momentum": momentum_ok,
             }
 
-            sig_scores = {}
-            for sname, conds in signals.items():
-                passed = sum(bool(v) for v in conds)
-                total  = len(conds)
-                sig_scores[sname] = {"passed": passed, "total": total, "fire": passed == total}
+            # V10 Strategy Conditions (SHORT)
+            dist_short = (ema21 - price) / atr_val if atr_val > 0 else 0
+            macd_imp_short = macd_hist < macd_hist_prev
 
-            # ── Candle pattern detection ───────────────────────────
-            df_htf   = get_ohlcv(symbol, c.PATTERN_TF, limit=50)
-            df_htf   = compute_all(df_htf)
-            patterns = detect_candle_patterns(df_htf)
-            top_pattern  = next((p for p in PATTERN_PRIORITY if p in patterns), None)
-            pattern_type = patterns.get(top_pattern, None) if top_pattern else None
+            short_conditions = {
+                "Trend (E21<E50)": ema21 < ema50,
+                "ADX ≥ 20": adx >= 20,
+                "Pullback Zone": -0.5 <= dist_short <= 2.5,
+                "Bearish Candle": candle_bearish,
+                "Body > 15%": body_pct >= 0.15,
+                "RSI OK (25-72)": 25 <= rsi_val <= 72,
+                "Momentum": macd_imp_short or vol_surge or squeeze_fire,
+            }
+
+            long_passed = sum(1 for v in long_conditions.values() if v)
+            short_passed = sum(1 for v in short_conditions.values() if v)
+            long_fire = long_passed == len(long_conditions)
+            short_fire = short_passed == len(short_conditions)
+
+            # Determine dominant signal direction
+            if htf_bias == "LONG" or (htf_bias is None and ema21 > ema50):
+                primary_dir = "LONG"
+                conds = long_conditions
+                passed = long_passed
+                total = len(long_conditions)
+                fire = long_fire
+            elif htf_bias == "SHORT" or (htf_bias is None and ema21 < ema50):
+                primary_dir = "SHORT"
+                conds = short_conditions
+                passed = short_passed
+                total = len(short_conditions)
+                fire = short_fire
+            else:
+                primary_dir = "NEUTRAL"
+                conds = long_conditions
+                passed = long_passed
+                total = len(long_conditions)
+                fire = False
+
+            # ML Score
+            ml_long_conf = None
+            ml_short_conf = None
+            try:
+                if ml_filter.is_trained:
+                    df_slice = df.iloc[-15:] if len(df) >= 15 else df
+                    # LONG score
+                    ml_feat_l = extract_features_extended(curr, prev, price, atr_val, Signal.LONG, df_slice=df_slice)
+                    _, ml_long_conf, _, _ = ml_filter.should_take_trade(ml_feat_l)
+                    # SHORT score
+                    ml_feat_s = extract_features_extended(curr, prev, price, atr_val, Signal.SHORT, df_slice=df_slice)
+                    _, ml_short_conf, _, _ = ml_filter.should_take_trade(ml_feat_s)
+            except:
+                pass
 
             results.append({
                 "symbol"      : symbol,
                 "price"       : round(price, 5),
-                "regime"      : regime,
-                "spread"      : round(spread, 3),
-                "rsi"         : round(float(curr["rsi"]), 1),
-                "macd"        : round(float(curr["macd_hist"]), 6),
-                "atr"         : round(float(curr["atr"]), 6),
-                "vol"         : int(curr["volume"]),
-                "vol_ma"      : int(curr["vol_ma"]),
-                "bb_mid"      : round(float(curr["bb_mid"]), 5),
-                "ema_fast"    : round(float(curr["ema_fast"]), 5),
-                "ema_slow"    : round(float(curr["ema_slow"]), 5),
-                "signals"     : sig_scores,
+                "adx"         : round(adx, 1),
+                "rsi"         : round(rsi_val, 1),
+                "macd_hist"   : round(macd_hist, 6),
+                "atr"         : round(atr_val, 6),
+                "rel_vol"     : round(rel_vol, 2),
+                "ema21"       : round(ema21, 5),
+                "ema50"       : round(ema50, 5),
+                "dist_ema21"  : round(dist_from_ema21, 2),
+                "body_pct"    : round(body_pct, 2),
+                "htf_bias"    : htf_bias,
+                "primary_dir" : primary_dir,
+                "conditions"  : conds,
+                "passed"      : passed,
+                "total"       : total,
+                "fire"        : fire,
+                "squeeze_fire": squeeze_fire,
                 "lev"         : c.SYMBOL_LEVERAGE.get(symbol, c.LEVERAGE),
-                "pattern"     : top_pattern,
-                "pattern_type": pattern_type,
+                "ml_long"     : round(float(ml_long_conf) * 100, 1) if ml_long_conf is not None else None,
+                "ml_short"    : round(float(ml_short_conf) * 100, 1) if ml_short_conf is not None else None,
             })
             time.sleep(0.2)
         except Exception as e:
@@ -523,14 +553,13 @@ HTML = """
           <table>
             <thead>
               <tr>
-                <th>#</th><th>Symbol</th><th>Price</th><th>Regime</th>
-                <th>RSI</th><th>MACD Hist</th><th>Vol Ratio</th>
-                <th>EMA Spread</th><th>Lev</th><th>Signal Scores</th>
-                <th>Candle Pattern</th><th>Status</th>
+                <th>#</th><th>Symbol</th><th>Price</th><th>HTF Bias</th>
+                <th>ADX</th><th>RSI</th><th>Dist EMA21</th><th>Vol</th>
+                <th>ML Score</th><th>Lev</th><th>V10 Conditions</th><th>Status</th>
               </tr>
             </thead>
             <tbody id="indicator-table">
-              <tr><td colspan="12" style="color:var(--muted);text-align:center;padding:40px;font-size:12px">
+              <tr><td colspan="11" style="color:var(--muted);text-align:center;padding:40px;font-size:12px">
                 ⏳ Fetching data...
               </td></tr>
             </tbody>
@@ -560,7 +589,7 @@ HTML = """
 
 </div>
 
-<footer>Auto-refreshes every 60s &nbsp;·&nbsp; Mudrex Algo Bot &nbsp;·&nbsp; 15m timeframe</footer>
+<footer>Auto-refreshes every 60s &nbsp;·&nbsp; Mudrex Algo Bot V10 &nbsp;·&nbsp; 4H Momentum Continuation</footer>
 
 <script>
 // ── STATE ────────────────────────────────────────────────────────
@@ -580,34 +609,67 @@ function rsiBarColor(v) {
   if (v <= 35) return "var(--blue)";
   return "var(--green)";
 }
-function sigClass(passed, total, fire) {
-  if (fire)              return "fire";
-  if (passed >= total-1) return "close";
-  if (passed >= total-3) return "mid";
-  return "low";
-}
 function levClass(lev) {
   if (lev >= 10) return "lev-10";
   if (lev >= 5)  return "lev-5";
   return "lev-2";
 }
-function spreadColor(s) {
-  if (s > 0.5) return "var(--green)";
-  if (s > 0.1) return "var(--yellow)";
+function htfBiasHTML(bias) {
+  if (bias === "LONG")  return '<span style="color:var(--green);font-weight:700;font-size:11px">▲ LONG</span>';
+  if (bias === "SHORT") return '<span style="color:var(--red);font-weight:700;font-size:11px">▼ SHORT</span>';
+  return '<span style="color:var(--muted);font-size:11px">— Neutral</span>';
+}
+function distColor(d) {
+  if (d >= -0.5 && d <= 2.5) return "var(--green)";
+  return "var(--red)";
+}
+function adxColor(v) {
+  if (v >= 30) return "var(--green)";
+  if (v >= 20) return "var(--yellow)";
+  return "var(--red)";
+}
+function volColor(v) {
+  if (v >= 1.2) return "var(--green)";
+  if (v >= 0.8) return "var(--text)";
   return "var(--muted)";
 }
-function patternHTML(name, type) {
-  if (!name) return '<span style="color:#2e3a4a;font-size:10px">—</span>';
-  const color = type === "bullish" ? "var(--green)"
-              : type === "bearish" ? "var(--red)"
-              : "var(--yellow)";
-  const icon  = type === "bullish" ? "▲" : type === "bearish" ? "▼" : "◆";
-  return `<span style="color:${color};font-size:10px;font-weight:600;
-    background:${color}18;border:1px solid ${color}44;
-    padding:2px 7px;border-radius:4px;white-space:nowrap">
-    ${icon} ${name}</span>`;
+function mlScoreHTML(row) {
+  const dir = row.primary_dir;
+  const longS = row.ml_long;
+  const shortS = row.ml_short;
+  if (longS === null && shortS === null) return '<span style="color:var(--muted);font-size:10px">N/A</span>';
+  let html = '';
+  if (longS !== null) {
+    const lCol = longS >= 50 ? "var(--green)" : "var(--red)";
+    const lBold = dir === "LONG" ? "font-weight:700;" : "";
+    html += `<div style="font-size:10px;${lBold}color:${lCol}">L: ${longS}%</div>`;
+  }
+  if (shortS !== null) {
+    const sCol = shortS >= 50 ? "var(--green)" : "var(--red)";
+    const sBold = dir === "SHORT" ? "font-weight:700;" : "";
+    html += `<div style="font-size:10px;${sBold}color:${sCol}">S: ${shortS}%</div>`;
+  }
+  return html;
 }
-function statusHTML(symbol, anyFire) {
+function conditionsHTML(conds, passed, total, fire) {
+  const entries = Object.entries(conds);
+  let html = '<div class="sig-row">';
+  entries.forEach(([name, ok]) => {
+    const cls = ok ? "fire" : "low";
+    const icon = ok ? "✓" : "✗";
+    html += `<span class="sig-pip ${cls}" title="${name}">${icon} ${name}</span>`;
+  });
+  html += '</div>';
+  return html;
+}
+function conditionsPipsHTML(passed, total, fire, dir) {
+  const pct = Math.round((passed/total)*100);
+  if (fire) return `<span class="sig-pip fire">🟢 ${dir} ${passed}/${total}</span>`;
+  if (passed >= total-1) return `<span class="sig-pip close">${dir} ${passed}/${total} (${pct}%)</span>`;
+  if (passed >= total-2) return `<span class="sig-pip mid">${dir} ${passed}/${total} (${pct}%)</span>`;
+  return `<span class="sig-pip low">${dir} ${passed}/${total}</span>`;
+}
+function statusHTML(symbol, fire) {
   const isActive = allPositions.some(p => p.symbol === symbol);
   if (isActive) {
     return `<span style="display:inline-flex;align-items:center;gap:5px;
@@ -619,7 +681,7 @@ function statusHTML(symbol, anyFire) {
       animation:blink 1s infinite;display:inline-block"></span>
       ACTIVE</span>`;
   }
-  if (anyFire) {
+  if (fire) {
     return `<span style="display:inline-flex;align-items:center;gap:5px;
       font-size:10px;font-weight:700;color:var(--yellow);
       background:#ffb84d18;border:1px solid #ffb84d44;
@@ -748,10 +810,6 @@ async function refresh() {
       }
 
       const isActive  = allPositions.some(p => p.symbol === row.symbol);
-      const anyFire   = Object.values(row.signals).some(s => s.fire);
-      const volRatio  = row.vol_ma > 0 ? (row.vol / row.vol_ma).toFixed(2) : "—";
-      const volColor  = row.vol > row.vol_ma ? "var(--green)" : "var(--muted)";
-      const macdColor = row.macd > 0 ? "var(--green)" : "var(--red)";
       const rsiPct    = Math.min(100, Math.max(0, row.rsi));
 
       const rsiHTML = `
@@ -762,19 +820,15 @@ async function refresh() {
           </div>
         </div>`;
 
-      const sigHTML = Object.entries(row.signals).map(([name, s]) => {
-        const cls   = sigClass(s.passed, s.total, s.fire);
-        const label = s.fire ? "🟢 " + name : `${name} ${s.passed}/${s.total}`;
-        return `<span class="sig-pip ${cls}">${label}</span>`;
-      }).join("");
+      const condsHTML = conditionsPipsHTML(row.passed, row.total, row.fire, row.primary_dir);
+      const htfHTML   = htfBiasHTML(row.htf_bias);
+      const sHTML     = statusHTML(row.symbol, row.fire);
+      const mlHTML    = mlScoreHTML(row);
 
-      const pHTML = patternHTML(row.pattern, row.pattern_type);
-      const sHTML = statusHTML(row.symbol, anyFire);
-
-      // Desktop row — active-row takes priority over fire-row
+      // Desktop row
       const tr = document.createElement("tr");
-      if      (isActive) tr.classList.add("active-row");
-      else if (anyFire)  tr.classList.add("fire-row");
+      if      (isActive)  tr.classList.add("active-row");
+      else if (row.fire)  tr.classList.add("fire-row");
       tr.innerHTML = `
         <td style="color:var(--muted);font-size:11px">${idx+1}</td>
         <td>
@@ -782,23 +836,20 @@ async function refresh() {
           <div class="sym-sub">ATR: ${row.atr}</div>
         </td>
         <td style="font-weight:600">$${row.price}</td>
-        <td>
-          <span class="regime-${row.regime.toLowerCase()}">${row.regime}</span>
-          <div style="font-size:10px;color:var(--muted);margin-top:2px">${row.spread}%</div>
-        </td>
+        <td>${htfHTML}</td>
+        <td style="color:${adxColor(row.adx)};font-weight:600">${row.adx}</td>
         <td>${rsiHTML}</td>
-        <td style="color:${macdColor};font-size:11px">${row.macd > 0 ? "+" : ""}${row.macd}</td>
-        <td style="color:${volColor}">${volRatio}x</td>
-        <td style="color:${spreadColor(row.spread)};font-size:11px">${row.spread}%</td>
+        <td style="color:${distColor(row.dist_ema21)};font-weight:600">${row.dist_ema21 > 0 ? "+" : ""}${row.dist_ema21} ATR</td>
+        <td style="color:${volColor(row.rel_vol)}">${row.rel_vol}x</td>
+        <td>${mlHTML}</td>
         <td><span class="lev ${levClass(row.lev)}">${row.lev}x</span></td>
-        <td><div class="sig-row">${sigHTML}</div></td>
-        <td>${pHTML}</td>
+        <td><div class="sig-row">${condsHTML}</div></td>
         <td>${sHTML}</td>`;
       tbody.appendChild(tr);
 
       // Mobile card
       const mc = document.createElement("div");
-      mc.className = "m-card" + (isActive ? " active-row" : anyFire ? " fire-row" : "");
+      mc.className = "m-card" + (isActive ? " active-row" : row.fire ? " fire-row" : "");
       mc.innerHTML = `
         <div class="m-card-top">
           <div>
@@ -807,19 +858,20 @@ async function refresh() {
           </div>
           <div style="text-align:right">
             <div class="m-price">$${row.price}</div>
-            <div style="margin-top:4px"><span class="lev ${levClass(row.lev)}">${row.lev}x</span></div>
+            <div style="margin-top:4px">${htfHTML}</div>
           </div>
         </div>
         <div class="m-grid">
-          <div class="m-item"><span class="m-lbl">Regime</span><span class="m-val regime-${row.regime.toLowerCase()}">${row.regime}</span></div>
+          <div class="m-item"><span class="m-lbl">ADX</span><span class="m-val" style="color:${adxColor(row.adx)}">${row.adx}</span></div>
           <div class="m-item"><span class="m-lbl">RSI</span><span class="m-val" style="color:${rsiColor(row.rsi)}">${row.rsi}</span></div>
-          <div class="m-item"><span class="m-lbl">MACD</span><span class="m-val" style="color:${macdColor}">${row.macd > 0 ? "+" : ""}${row.macd}</span></div>
-          <div class="m-item"><span class="m-lbl">Vol Ratio</span><span class="m-val" style="color:${volColor}">${volRatio}x</span></div>
-          <div class="m-item"><span class="m-lbl">EMA Spread</span><span class="m-val" style="color:${spreadColor(row.spread)}">${row.spread}%</span></div>
+          <div class="m-item"><span class="m-lbl">Dist EMA21</span><span class="m-val" style="color:${distColor(row.dist_ema21)}">${row.dist_ema21} ATR</span></div>
+          <div class="m-item"><span class="m-lbl">Vol</span><span class="m-val" style="color:${volColor(row.rel_vol)}">${row.rel_vol}x</span></div>
+          <div class="m-item"><span class="m-lbl">ML Score</span><span class="m-val">${mlHTML}</span></div>
+          <div class="m-item"><span class="m-lbl">Squeeze</span><span class="m-val" style="color:${row.squeeze_fire ? 'var(--yellow)' : 'var(--muted)'}">${row.squeeze_fire ? '🔥' : '—'}</span></div>
         </div>
-        <div class="m-sigs">${sigHTML}</div>
         <div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-          ${pHTML}
+          <span class="lev ${levClass(row.lev)}">${row.lev}x</span>
+          ${condsHTML}
           ${sHTML}
         </div>`;
       mCards.appendChild(mc);
