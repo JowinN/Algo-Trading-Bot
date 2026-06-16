@@ -9,7 +9,7 @@ from mudrex import TradeClient
 from config     import Config as c
 from data       import get_ohlcv, get_current_price
 from indicators import compute_all, ema
-from ml_model   import MLFilter, extract_features_extended
+from ml_model   import MLFilter, extract_features_extended, extract_regime_features, compute_regimes
 from strategy   import Signal
 
 load_dotenv()
@@ -100,12 +100,12 @@ def fetch_indicators():
             momentum_ok = macd_improving or vol_surge or squeeze_fire
 
             long_conditions = {
-                "Trend (E21>E50)": ema21 > ema50,
-                "ADX ≥ 20": adx >= 20,
+                "EMA Trend": ema21 > ema50,
+                "ADX≥20": adx >= 20,
                 "Pullback Zone": -0.5 <= dist_from_ema21 <= 2.5,
                 "Bullish Candle": candle_bullish,
-                "Body > 15%": body_pct >= 0.15,
-                "RSI OK (28-75)": 28 <= rsi_val <= 75,
+                "Body≥15%": body_pct >= 0.15,
+                "RSI 28-75": 28 <= rsi_val <= 75,
                 "Momentum": momentum_ok,
             }
 
@@ -114,12 +114,12 @@ def fetch_indicators():
             macd_imp_short = macd_hist < macd_hist_prev
 
             short_conditions = {
-                "Trend (E21<E50)": ema21 < ema50,
-                "ADX ≥ 20": adx >= 20,
+                "EMA Trend": ema21 < ema50,
+                "ADX≥20": adx >= 20,
                 "Pullback Zone": -0.5 <= dist_short <= 2.5,
                 "Bearish Candle": candle_bearish,
-                "Body > 15%": body_pct >= 0.15,
-                "RSI OK (25-72)": 25 <= rsi_val <= 72,
+                "Body≥15%": body_pct >= 0.15,
+                "RSI 25-72": 25 <= rsi_val <= 72,
                 "Momentum": macd_imp_short or vol_surge or squeeze_fire,
             }
 
@@ -153,13 +153,21 @@ def fetch_indicators():
             ml_short_conf = None
             try:
                 if ml_filter.is_trained:
-                    df_slice = df.iloc[-15:] if len(df) >= 15 else df
-                    # LONG score
-                    ml_feat_l = extract_features_extended(curr, prev, price, atr_val, Signal.LONG, df_slice=df_slice)
-                    _, ml_long_conf, _, _ = ml_filter.should_take_trade(ml_feat_l)
-                    # SHORT score
-                    ml_feat_s = extract_features_extended(curr, prev, price, atr_val, Signal.SHORT, df_slice=df_slice)
-                    _, ml_short_conf, _, _ = ml_filter.should_take_trade(ml_feat_s)
+                    if ml_filter.version == "v3_regime_ensemble":
+                        df_regime = compute_regimes(df.copy())
+                        idx = len(df_regime) - 1
+                        ml_feat_l = extract_regime_features(df_regime, idx, "LONG")
+                        ml_feat_s = extract_regime_features(df_regime, idx, "SHORT")
+                        if ml_feat_l:
+                            _, ml_long_conf, _, _ = ml_filter.should_take_trade(ml_feat_l)
+                        if ml_feat_s:
+                            _, ml_short_conf, _, _ = ml_filter.should_take_trade(ml_feat_s)
+                    else:
+                        df_slice = df.iloc[-15:] if len(df) >= 15 else df
+                        ml_feat_l = extract_features_extended(curr, prev, price, atr_val, Signal.LONG, df_slice=df_slice)
+                        _, ml_long_conf, _, _ = ml_filter.should_take_trade(ml_feat_l)
+                        ml_feat_s = extract_features_extended(curr, prev, price, atr_val, Signal.SHORT, df_slice=df_slice)
+                        _, ml_short_conf, _, _ = ml_filter.should_take_trade(ml_feat_s)
             except:
                 pass
 
@@ -178,6 +186,7 @@ def fetch_indicators():
                 "htf_bias"    : htf_bias,
                 "primary_dir" : primary_dir,
                 "conditions"  : conds,
+                "failed"      : [k for k, v in conds.items() if not v],
                 "passed"      : passed,
                 "total"       : total,
                 "fire"        : fire,
@@ -662,12 +671,13 @@ function conditionsHTML(conds, passed, total, fire) {
   html += '</div>';
   return html;
 }
-function conditionsPipsHTML(passed, total, fire, dir) {
+function conditionsPipsHTML(passed, total, fire, dir, failed) {
   const pct = Math.round((passed/total)*100);
+  const failText = failed && failed.length > 0 ? `<div style="font-size:9px;color:var(--muted);margin-top:2px">✗ ${failed.join(', ')}</div>` : '';
   if (fire) return `<span class="sig-pip fire">🟢 ${dir} ${passed}/${total}</span>`;
-  if (passed >= total-1) return `<span class="sig-pip close">${dir} ${passed}/${total} (${pct}%)</span>`;
-  if (passed >= total-2) return `<span class="sig-pip mid">${dir} ${passed}/${total} (${pct}%)</span>`;
-  return `<span class="sig-pip low">${dir} ${passed}/${total}</span>`;
+  if (passed >= total-1) return `<span class="sig-pip close">${dir} ${passed}/${total} (${pct}%)</span>${failText}`;
+  if (passed >= total-2) return `<span class="sig-pip mid">${dir} ${passed}/${total} (${pct}%)</span>${failText}`;
+  return `<span class="sig-pip low">${dir} ${passed}/${total}</span>${failText}`;
 }
 function statusHTML(symbol, fire) {
   const isActive = allPositions.some(p => p.symbol === symbol);
@@ -820,7 +830,7 @@ async function refresh() {
           </div>
         </div>`;
 
-      const condsHTML = conditionsPipsHTML(row.passed, row.total, row.fire, row.primary_dir);
+      const condsHTML = conditionsPipsHTML(row.passed, row.total, row.fire, row.primary_dir, row.failed);
       const htfHTML   = htfBiasHTML(row.htf_bias);
       const sHTML     = statusHTML(row.symbol, row.fire);
       const mlHTML    = mlScoreHTML(row);

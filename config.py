@@ -10,7 +10,6 @@ class Config:
         "TIAUSDT", "RUNEUSDT", "LDOUSDT",
         "IMXUSDT", "GRTUSDT", "RENDERUSDT",
         "WLDUSDT", "ONDOUSDT", "JUPUSDT",
-        "TONUSDT",
     ]
 
     # ── PER-SYMBOL LEVERAGE ────────────────────────────────────────
@@ -50,7 +49,6 @@ class Config:
         "WLDUSDT"   : 0.1,
         "ONDOUSDT"  : 0.1,
         "JUPUSDT"   : 1,
-        "TONUSDT"   : 0.1,
     }
     QTY_STEP = 1
 

@@ -9,7 +9,7 @@ from config   import Config as c
 from data     import get_ohlcv, get_current_price
 from strategy import generate_signal, Signal
 from risk     import position_size, daily_limit_ok
-from ml_model import MLFilter, extract_features_extended, calculate_mfe_mae
+from ml_model import MLFilter, extract_features_extended, extract_regime_features, compute_regimes, calculate_mfe_mae
 import json
 from collections import deque
 import requests
@@ -76,6 +76,13 @@ def load_online_samples():
         try:
             with open(ONLINE_SAMPLES_FILE, "r") as f:
                 online_pending = json.load(f)
+            # Discard samples with wrong feature count for current model
+            if ml_filter.is_trained and ml_filter.feature_names and online_pending:
+                expected = len(ml_filter.feature_names)
+                valid = [s for s in online_pending if len(s.get("features", {})) == expected]
+                if len(valid) < len(online_pending):
+                    log.info(f"  🗑️  Discarded {len(online_pending) - len(valid)} stale samples (wrong feature count)")
+                    online_pending = valid
             log.info(f"  📚  Loaded {len(online_pending)} pending online samples")
         except:
             online_pending = []
@@ -507,15 +514,21 @@ def run():
 
                     # ── Online Learning: store sample for ALL signals ────
                     try:
-                        curr_row = df.iloc[-1]
-                        prev_row = df.iloc[-2]
-                        df_slice = df.iloc[-15:] if len(df) >= 15 else df
-                        atr_live = float(curr_row["atr"])
+                        atr_live = float(df.iloc[-1]["atr"])
                         for direction_sample in ["LONG", "SHORT"]:
-                            feats = extract_features_extended(
-                                curr_row, prev_row, price, atr_live,
-                                direction_sample, df_slice=df_slice
-                            )
+                            if ml_filter.version == "v3_regime_ensemble":
+                                df_regime = compute_regimes(df.copy())
+                                feats = extract_regime_features(df_regime, len(df_regime) - 1, direction_sample)
+                                if feats is None:
+                                    continue
+                            else:
+                                curr_row = df.iloc[-1]
+                                prev_row = df.iloc[-2]
+                                df_slice = df.iloc[-15:] if len(df) >= 15 else df
+                                feats = extract_features_extended(
+                                    curr_row, prev_row, price, atr_live,
+                                    direction_sample, df_slice=df_slice
+                                )
                             online_pending.append({
                                 "symbol": symbol,
                                 "direction": direction_sample,
@@ -536,12 +549,21 @@ def run():
 
                         if ml_filter.is_trained:
                             try:
-                                curr_row = df.iloc[-1]
-                                prev_row = df.iloc[-2]
-                                df_slice = df.iloc[-15:] if len(df) >= 15 else df
-                                ml_features = extract_features_extended(
-                                    curr_row, prev_row, price, atr_v, signal, df_slice=df_slice
-                                )
+                                if ml_filter.version == "v3_regime_ensemble":
+                                    # V3: compute regimes and use deep regime features
+                                    df_regime = compute_regimes(df.copy())
+                                    direction_str = "LONG" if signal == Signal.LONG else "SHORT"
+                                    ml_features = extract_regime_features(df_regime, len(df_regime) - 1, direction_str)
+                                    if ml_features is None:
+                                        ml_features = {}  # fallback - will be padded with zeros
+                                else:
+                                    # V2: use extended features
+                                    curr_row = df.iloc[-1]
+                                    prev_row = df.iloc[-2]
+                                    df_slice = df.iloc[-15:] if len(df) >= 15 else df
+                                    ml_features = extract_features_extended(
+                                        curr_row, prev_row, price, atr_v, signal, df_slice=df_slice
+                                    )
                                 should_take, ml_conf, ml_sl_mult, ml_tp_r = ml_filter.should_take_trade(ml_features)
 
                                 if not should_take:
