@@ -97,4 +97,4 @@ class Config:
     LOSS_COOLDOWN_CANDLES = 3     # 12 hours cooldown (3 x 4H)
 
     # ── BOT LOOP ────────────────────────────────────────────────────
-    LOOP_INTERVAL    = 120        # Check every 2min
+    LOOP_INTERVAL    = 360        # Check every 2min
