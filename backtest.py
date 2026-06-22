@@ -8,7 +8,7 @@ from indicators import compute_all, compute_htf
 from strategy import generate_signal, Signal
 from risk import position_size
 from config import Config as c
-from ml_model import MLFilter, extract_features
+from ml_model import MLFilter, extract_features, extract_regime_features, compute_regimes
 import json
 
 BYBIT_BASE = "https://api.bybit.com/v5/market"
@@ -200,11 +200,20 @@ class BacktestEngine:
             df = all_data_4h[symbol]
             all_data_4h[symbol] = df[(df.index >= min_date) & (df.index <= max_date)]
         
+        # ML Filter — initialize and load production model early to check version
+        ml_filter = MLFilter(confidence_threshold=0.55)
+        if ml_filter.load():
+            print(f"   ✓ Loaded production ML model (version: {getattr(ml_filter, 'version', 'v2')})")
+        else:
+            print("   ⚠ No production ML model found. Running with online learning.")
+
         # Compute indicators on 4H data
         print("\n Computing 4H indicators...")
         all_indicators = {}
         for symbol, df in all_data_4h.items():
             indicators_df = compute_all(df)
+            if ml_filter.is_trained and getattr(ml_filter, "version", "v2") in ["v3_regime_ensemble", "v4_direction_ensemble"]:
+                indicators_df = compute_regimes(indicators_df)
             indicators_df = indicators_df.reset_index()
             indicators_df.rename(columns={"index": "timestamp"}, inplace=True)
             all_indicators[symbol] = indicators_df
@@ -235,8 +244,7 @@ class BacktestEngine:
         consecutive_losses = 0
         symbol_cooldown = {}  # {symbol: candle_num when cooldown expires}
         
-        # ML Filter — walk-forward
-        ml_filter = MLFilter(confidence_threshold=0.55)
+        # ML Filter — walk-forward (already initialized and loaded)
         ml_blocked = 0
         ml_passed = 0
         pending_ml_features = {}  # {position_id: features_dict}
@@ -405,9 +413,15 @@ class BacktestEngine:
                                 entry_atr = float(signal_df.iloc[-1]["atr"])
                                 
                                 # ML Filter — extract features and check confidence
-                                curr_row = signal_df.iloc[-1]
-                                prev_row = signal_df.iloc[-2]
-                                ml_features = extract_features(curr_row, prev_row, entry_price, entry_atr, signal)
+                                if ml_filter.is_trained and getattr(ml_filter, "version", "v2") in ["v3_regime_ensemble", "v4_direction_ensemble"]:
+                                    ml_features = extract_regime_features(all_indicators[symbol], row_idx, signal)
+                                else:
+                                    curr_row = signal_df.iloc[-1]
+                                    prev_row = signal_df.iloc[-2]
+                                    ml_features = extract_features(curr_row, prev_row, entry_price, entry_atr, signal)
+                                
+                                if ml_features is None:
+                                    continue
                                 should_take, ml_conf, ml_sl_mult, ml_tp_r = ml_filter.should_take_trade(ml_features)
                                 
                                 if not should_take:

@@ -59,8 +59,8 @@ def load_production_model():
 
     print(f"Model loaded from: {model_path}")
     print(f"  Keys: {list(data.keys())}")
-    print(f"  Model type: {type(data.get('classifier', data.get('model', 'unknown')))}")
-    if "feature_mask" in data:
+    print(f"  Model type: {type(data.get('classifier', data.get('model', data.get('classifier_long', 'unknown'))))}")
+    if "feature_mask" in data and data["feature_mask"] is not None:
         mask = data["feature_mask"]
         print(f"  Feature mask: {sum(mask)}/{len(mask)} features selected")
     if "feature_names" in data:
@@ -78,7 +78,7 @@ def load_production_model():
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "historical_data")
 
 
-def generate_signals_for_symbol(symbol, use_last_pct=0.3):
+def generate_signals_for_symbol(symbol, model_data, use_last_pct=0.3):
     """
     Generate signals from historical CSV data.
     Uses the last `use_last_pct` of data as unseen forward-test window.
@@ -92,22 +92,27 @@ def generate_signals_for_symbol(symbol, use_last_pct=0.3):
         if len(df_15m) < 1000:
             return []
 
-        # Use last portion as "new" data the model hasn't been optimized on
+        # Get split timestamp
         split_idx = int(len(df_15m) * (1 - use_last_pct))
-        df_15m = df_15m.iloc[split_idx:]
+        split_ts = df_15m.index[split_idx]
 
-        # Resample to 4H
+        # Resample full data to 4H to ensure warm indicators
         df_4h = df_15m.resample("4h").agg({
             "open": "first", "high": "max",
             "low": "min", "close": "last", "volume": "sum"
         }).dropna()
 
-        if len(df_4h) < 60:
+        if len(df_4h) < 100:
             return []
 
         df_4h = compute_all(df_4h)
 
-        # Get HTF (daily) from same data
+        version = model_data.get("version", "v2")
+        if version in ["v3_regime_ensemble", "v4_direction_ensemble"]:
+            from ml_model import compute_regimes, extract_regime_features
+            df_4h = compute_regimes(df_4h)
+
+        # Get HTF (daily) from full data
         df_daily = df_15m.resample("1D").agg({
             "open": "first", "high": "max",
             "low": "min", "close": "last", "volume": "sum"
@@ -119,9 +124,19 @@ def generate_signals_for_symbol(symbol, use_last_pct=0.3):
             df_daily["ema20"] = ema_func(df_daily["close"], 20)
             df_daily["ema50"] = ema_func(df_daily["close"], 50)
             df_daily = df_daily.dropna()
+
+        # Find the starting index in df_4h corresponding to split_ts
+        start_idx = 0
+        for idx in range(len(df_4h)):
+            if df_4h.index[idx] >= split_ts:
+                start_idx = idx
+                break
+        
+        # Ensure we have at least 55 context bars
+        start_idx = max(start_idx, 55)
         
         signals = []
-        for i in range(55, len(df_4h) - 8):  # Leave 8 bars for forward look
+        for i in range(start_idx, len(df_4h) - 8):  # Leave 8 bars for forward look
             # Update HTF bias at each point
             candle_time = df_4h.index[i]
             if len(df_daily) >= 50:
@@ -151,8 +166,11 @@ def generate_signals_for_symbol(symbol, use_last_pct=0.3):
             if atr_val <= 0:
                 continue
 
-            df_slice = df_4h.iloc[max(0, i-10):i+1]
-            features = extract_features_extended(curr, prev, price, atr_val, direction, df_slice)
+            if version in ["v3_regime_ensemble", "v4_direction_ensemble"]:
+                features = extract_regime_features(df_4h, i, direction)
+            else:
+                df_slice = df_4h.iloc[max(0, i-10):i+1]
+                features = extract_features_extended(curr, prev, price, atr_val, direction, df_slice)
 
             # Look ahead for outcome (8 candles = 32 hours forward)
             future = df_4h.iloc[i+1:i+9]
@@ -227,51 +245,36 @@ def generate_signals_for_symbol(symbol, use_last_pct=0.3):
 
 def evaluate_model_on_data(model_data, signals):
     """Score all signals through the model and evaluate."""
-    classifier = model_data.get("classifier", model_data.get("model"))
-    scaler = model_data.get("scaler")
-    feature_mask = model_data.get("feature_mask")
-    feature_names = model_data.get("feature_names")
-    threshold = model_data.get("threshold", 0.5)
-
-    if classifier is None:
-        print("ERROR: No classifier found in model data")
-        return None
+    from ml_model import MLFilter
+    from sklearn.preprocessing import StandardScaler
+    
+    ml_filter = MLFilter()
+    ml_filter.classifier = model_data.get("classifier")
+    ml_filter.sl_regressor = model_data.get("sl_regressor")
+    ml_filter.tp_regressor = model_data.get("tp_regressor")
+    ml_filter.scaler = model_data.get("scaler", StandardScaler())
+    ml_filter.feature_names = model_data.get("feature_names")
+    ml_filter.feature_mask = model_data.get("feature_mask")
+    ml_filter.confidence_threshold = model_data.get("confidence_threshold", 0.5)
+    ml_filter.version = model_data.get("version", "v2")
+    ml_filter.classifier_long = model_data.get("classifier_long")
+    ml_filter.classifier_short = model_data.get("classifier_short")
+    ml_filter.sl_regressor_long = model_data.get("sl_regressor_long")
+    ml_filter.sl_regressor_short = model_data.get("sl_regressor_short")
+    ml_filter.tp_regressor_long = model_data.get("tp_regressor_long")
+    ml_filter.tp_regressor_short = model_data.get("tp_regressor_short")
+    ml_filter.scaler_long = model_data.get("scaler_long", StandardScaler())
+    ml_filter.scaler_short = model_data.get("scaler_short", StandardScaler())
+    ml_filter.confidence_threshold_long = model_data.get("confidence_threshold_long", ml_filter.confidence_threshold)
+    ml_filter.confidence_threshold_short = model_data.get("confidence_threshold_short", ml_filter.confidence_threshold)
+    ml_filter.is_trained = True
 
     results = []
+    threshold = ml_filter.confidence_threshold
+
     for sig in signals:
         feat_dict = sig["features"]
-        
-        # Convert to array
-        if feature_names:
-            feat_vec = np.array([feat_dict.get(fn, 0.0) for fn in feature_names], dtype=np.float32)
-        else:
-            feat_vec = np.array(list(feat_dict.values()), dtype=np.float32)
-
-        # Apply feature mask
-        if feature_mask is not None:
-            mask = np.array(feature_mask, dtype=bool)
-            if len(feat_vec) >= len(mask):
-                feat_vec = feat_vec[:len(mask)][mask]
-            elif len(feat_vec) < len(mask):
-                padded = np.zeros(len(mask), dtype=np.float32)
-                padded[:len(feat_vec)] = feat_vec
-                feat_vec = padded[mask]
-
-        # Scale
-        if scaler is not None:
-            expected = scaler.n_features_in_ if hasattr(scaler, 'n_features_in_') else len(feat_vec)
-            if len(feat_vec) != expected:
-                padded = np.zeros(expected, dtype=np.float32)
-                padded[:min(len(feat_vec), expected)] = feat_vec[:expected]
-                feat_vec = padded
-            feat_vec = scaler.transform(feat_vec.reshape(1, -1))[0]
-
-        # Predict
-        feat_2d = feat_vec.reshape(1, -1)
-        if HAS_XGB and isinstance(classifier, xgb.XGBClassifier):
-            prob = classifier.predict_proba(feat_2d)[0][1]
-        else:
-            prob = classifier.predict_proba(feat_2d)[0][1]
+        should_take, prob, suggested_sl, suggested_tp = ml_filter.should_take_trade(feat_dict)
 
         results.append({
             "prob": prob,
@@ -282,7 +285,7 @@ def evaluate_model_on_data(model_data, signals):
             "mae_atr": sig["mae_atr"],
             "symbol": sig["symbol"],
             "direction": sig["direction"],
-            "passed": prob >= threshold
+            "passed": should_take
         })
 
     return results, threshold
@@ -515,7 +518,7 @@ def main():
     
     for i, symbol in enumerate(c.SYMBOLS):
         print(f"  [{i+1:2d}/{len(c.SYMBOLS)}] {symbol}...", end=" ", flush=True)
-        signals = generate_signals_for_symbol(symbol, use_last_pct=0.30)
+        signals = generate_signals_for_symbol(symbol, model_data, use_last_pct=0.30)
         print(f"{len(signals)} signals")
         all_signals.extend(signals)
         symbols_tested += 1

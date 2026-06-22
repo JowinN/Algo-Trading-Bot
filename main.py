@@ -516,7 +516,7 @@ def run():
                     try:
                         atr_live = float(df.iloc[-1]["atr"])
                         for direction_sample in ["LONG", "SHORT"]:
-                            if ml_filter.version == "v3_regime_ensemble":
+                            if ml_filter.version in ["v3_regime_ensemble", "v4_direction_ensemble"]:
                                 df_regime = compute_regimes(df.copy())
                                 feats = extract_regime_features(df_regime, len(df_regime) - 1, direction_sample)
                                 if feats is None:
@@ -549,8 +549,8 @@ def run():
 
                         if ml_filter.is_trained:
                             try:
-                                if ml_filter.version == "v3_regime_ensemble":
-                                    # V3: compute regimes and use deep regime features
+                                if ml_filter.version in ["v3_regime_ensemble", "v4_direction_ensemble"]:
+                                    # V3/V4: compute regimes and use deep regime features
                                     df_regime = compute_regimes(df.copy())
                                     direction_str = "LONG" if signal == Signal.LONG else "SHORT"
                                     ml_features = extract_regime_features(df_regime, len(df_regime) - 1, direction_str)

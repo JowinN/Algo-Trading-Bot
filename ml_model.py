@@ -183,6 +183,7 @@ def extract_features(curr, prev, price, atr_val, direction):
     features["momentum_regime"] = 1.0 if (macd_hist * dir_sign > 0 and rsi * dir_sign > 50 * dir_sign) else 0.0
     features["vol_regime"] = min(rel_vol, 3.0) / 3.0  # Capped normalized
     features["squeeze_fire"] = 1.0 if (curr.get("squeeze_fire", False)) else 0.0
+    features["direction_long"] = 1.0 if direction == "LONG" else 0.0
 
     return features
 
@@ -518,6 +519,7 @@ def extract_regime_features(df, idx, direction):
     features["momentum_accel"] = (mom_10 - mom_50) * dir_sign
     features["multi_tf_agree"] = 1.0 if (mom_10 * dir_sign > 0 and mom_50 * dir_sign > 0) else 0.0
     features["tf_conflict"] = 1.0 if (mom_10 * dir_sign > 0) != (mom_50 * dir_sign > 0) else 0.0
+    features["direction_long"] = 1.0 if direction == "LONG" else 0.0
 
     return features
 
@@ -670,6 +672,17 @@ class MLFilter:
         self.range_model = None
         self.quality_model = None
         self.trend_regime_idx = -1
+        # V4 direction ensemble fields
+        self.classifier_long = None
+        self.classifier_short = None
+        self.sl_regressor_long = None
+        self.sl_regressor_short = None
+        self.tp_regressor_long = None
+        self.tp_regressor_short = None
+        self.scaler_long = StandardScaler()
+        self.scaler_short = StandardScaler()
+        self.confidence_threshold_long = confidence_threshold
+        self.confidence_threshold_short = confidence_threshold
         self.version = "v2"
 
     def add_completed_trade(self, features: dict, won: bool, optimal_sl=None, optimal_tp=None):
@@ -702,11 +715,56 @@ class MLFilter:
         """
         Returns (should_take, confidence, suggested_sl_atr, suggested_tp_r).
         If not trained, returns defaults.
-        Supports V3 regime ensemble and V2 single-model inference.
+        Supports V4 direction ensemble, V3 regime ensemble and V2 single-model inference.
         """
         if not self.is_trained:
             return True, 0.5, 2.0, 3.0
 
+        # V4 direction ensemble logic
+        if getattr(self, "version", "v2") == "v4_direction_ensemble" and self.classifier_long is not None and self.classifier_short is not None:
+            direction_long_val = features.get("direction_long", 1.0)
+            is_long = direction_long_val == 1.0
+            
+            feature_vals = list(features.values())
+            feature_vals = self._apply_feature_mask(feature_vals)
+            
+            if is_long:
+                scaler_to_use = self.scaler_long
+                clf_to_use = self.classifier_long
+                sl_to_use = self.sl_regressor_long
+                tp_to_use = self.tp_regressor_long
+                threshold = getattr(self, "confidence_threshold_long", self.confidence_threshold)
+            else:
+                scaler_to_use = self.scaler_short
+                clf_to_use = self.classifier_short
+                sl_to_use = self.sl_regressor_short
+                tp_to_use = self.tp_regressor_short
+                threshold = getattr(self, "confidence_threshold_short", self.confidence_threshold)
+                
+            expected_n = scaler_to_use.n_features_in_
+            if len(feature_vals) > expected_n:
+                feature_vals = feature_vals[:expected_n]
+            elif len(feature_vals) < expected_n:
+                feature_vals.extend([0.0] * (expected_n - len(feature_vals)))
+                
+            X = np.array([feature_vals]).reshape(1, -1)
+            X_scaled = scaler_to_use.transform(X)
+            
+            prob = clf_to_use.predict_proba(X_scaled)[0][1]
+            should_take = prob >= threshold
+            
+            suggested_sl = 2.0
+            suggested_tp = 3.0
+            if sl_to_use is not None:
+                suggested_sl = float(sl_to_use.predict(X_scaled)[0])
+                suggested_sl = np.clip(suggested_sl, MIN_SL_ATR, MAX_SL_ATR)
+            if tp_to_use is not None:
+                suggested_tp = float(tp_to_use.predict(X_scaled)[0])
+                suggested_tp = np.clip(suggested_tp, MIN_TP_R, MAX_TP_R)
+                
+            return should_take, prob, suggested_sl, suggested_tp
+
+        # Legacy/V2/V3 single model logic
         feature_vals = list(features.values())
 
         # Apply feature mask if present (V2 XGBoost production model)
@@ -768,20 +826,93 @@ class MLFilter:
 
     def _train(self):
         """Train/retrain all models on accumulated online data.
-        V3: retrains global classifier with XGBoost, preserves trend/range/quality models.
-        V2: uses sklearn GradientBoosting as before.
+        V4: supports separate LONG/SHORT models based on direction_long feature.
+        V3: retrains global classifier with XGBoost.
+        V2: uses sklearn GradientBoosting.
         """
         X = np.array(self.training_features)
         y = np.array(self.training_labels)
+        y_sl = np.array(self.training_sl) if self.training_sl else None
+        y_tp = np.array(self.training_tp) if self.training_tp else None
 
         if len(set(y)) < 2:
             return
 
+        # V4 direction ensemble online retraining
+        if getattr(self, "version", "v2") == "v4_direction_ensemble" and HAS_XGB:
+            dir_idx = -1
+            if self.feature_names:
+                try:
+                    dir_idx = self.feature_names.index("direction_long")
+                except ValueError:
+                    pass
+            
+            if dir_idx != -1:
+                long_mask = X[:, dir_idx] == 1.0
+                short_mask = X[:, dir_idx] == 0.0
+
+                # Train LONG models
+                if long_mask.sum() >= MIN_TRAINING_SAMPLES and len(set(y[long_mask])) >= 2:
+                    X_long = X[long_mask]
+                    y_long = y[long_mask]
+                    self.scaler_long.fit(X_long)
+                    X_long_s = self.scaler_long.transform(X_long)
+                    
+                    self.classifier_long = xgb.XGBClassifier(
+                        n_estimators=100, max_depth=3, learning_rate=0.05, verbosity=0
+                    )
+                    self.classifier_long.fit(X_long_s, y_long)
+
+                    if y_sl is not None and len(y_sl) == len(X):
+                        y_sl_long = y_sl[long_mask]
+                        self.sl_regressor_long = xgb.XGBRegressor(
+                            n_estimators=50, max_depth=3, learning_rate=0.05, verbosity=0
+                        )
+                        self.sl_regressor_long.fit(X_long_s, y_sl_long)
+
+                    if y_tp is not None and len(y_tp) == len(X):
+                        y_tp_long = y_tp[long_mask]
+                        self.tp_regressor_long = xgb.XGBRegressor(
+                            n_estimators=50, max_depth=3, learning_rate=0.05, verbosity=0
+                        )
+                        self.tp_regressor_long.fit(X_long_s, y_tp_long)
+
+                # Train SHORT models
+                if short_mask.sum() >= MIN_TRAINING_SAMPLES and len(set(y[short_mask])) >= 2:
+                    X_short = X[short_mask]
+                    y_short = y[short_mask]
+                    self.scaler_short.fit(X_short)
+                    X_short_s = self.scaler_short.transform(X_short)
+                    
+                    self.classifier_short = xgb.XGBClassifier(
+                        n_estimators=100, max_depth=3, learning_rate=0.05, verbosity=0
+                    )
+                    self.classifier_short.fit(X_short_s, y_short)
+
+                    if y_sl is not None and len(y_sl) == len(X):
+                        y_sl_short = y_sl[short_mask]
+                        self.sl_regressor_short = xgb.XGBRegressor(
+                            n_estimators=50, max_depth=3, learning_rate=0.05, verbosity=0
+                        )
+                        self.sl_regressor_short.fit(X_short_s, y_sl_short)
+
+                    if y_tp is not None and len(y_tp) == len(X):
+                        y_tp_short = y_tp[short_mask]
+                        self.tp_regressor_short = xgb.XGBRegressor(
+                            n_estimators=50, max_depth=3, learning_rate=0.05, verbosity=0
+                        )
+                        self.tp_regressor_short.fit(X_short_s, y_tp_short)
+
+                self.feature_mask = None
+                self.is_trained = self.classifier_long is not None or self.classifier_short is not None
+                self.trades_since_retrain = 0
+                return
+
+        # Fallback to single scaler training
         self.scaler.fit(X)
         X_scaled = self.scaler.transform(X)
 
         if self.version == "v3_regime_ensemble" and HAS_XGB:
-            # V3: retrain global classifier with XGBoost, keep sub-models
             self.classifier = xgb.XGBClassifier(
                 n_estimators=200,
                 max_depth=4,
@@ -796,7 +927,6 @@ class MLFilter:
             )
             self.classifier.fit(X_scaled, y)
 
-            # Retrain quality regressor if enough data
             if self.training_sl and len(self.training_sl) >= MIN_TRAINING_SAMPLES:
                 from sklearn.ensemble import GradientBoostingRegressor as GBR
                 y_quality = np.array(self.training_sl[:len(X)])
@@ -806,12 +936,10 @@ class MLFilter:
                 )
                 self.quality_model.fit(X_scaled[:len(y_quality)], y_quality)
 
-            # trend_model, range_model, trend_regime_idx preserved from V3 pretrained
             print(f"   ML V3 retrained global classifier on {len(y)} trades | "
                   f"Acc: {self.classifier.score(X_scaled, y):.1%}")
 
         elif HAS_SKLEARN_GB:
-            # V2 fallback
             self.classifier = GradientBoostingClassifier(
                 n_estimators=50,
                 max_depth=2,
@@ -826,7 +954,6 @@ class MLFilter:
         else:
             return
 
-        # Train SL regressor (both V2 and V3)
         if len(self.training_sl) >= MIN_TRAINING_SAMPLES and HAS_SKLEARN_GB:
             y_sl = np.array(self.training_sl[:len(X)])
             self.sl_regressor = GradientBoostingRegressor(
@@ -839,7 +966,6 @@ class MLFilter:
             )
             self.sl_regressor.fit(X_scaled[:len(y_sl)], y_sl)
 
-        # Train TP regressor (both V2 and V3)
         if len(self.training_tp) >= MIN_TRAINING_SAMPLES and HAS_SKLEARN_GB:
             y_tp = np.array(self.training_tp[:len(X)])
             self.tp_regressor = GradientBoostingRegressor(
@@ -860,7 +986,40 @@ class MLFilter:
         """Get feature importance from classifier."""
         if not self.is_trained or self.feature_names is None:
             return {}
-        importances = self.classifier.feature_importances_
+        if getattr(self, "version", "v2") == "v4_direction_ensemble":
+            imp_long = None
+            if self.classifier_long is not None:
+                if hasattr(self.classifier_long, "estimator"):
+                    imp_long = self.classifier_long.estimator.feature_importances_
+                elif hasattr(self.classifier_long, "feature_importances_"):
+                    imp_long = self.classifier_long.feature_importances_
+
+            imp_short = None
+            if self.classifier_short is not None:
+                if hasattr(self.classifier_short, "estimator"):
+                    imp_short = self.classifier_short.estimator.feature_importances_
+                elif hasattr(self.classifier_short, "feature_importances_"):
+                    imp_short = self.classifier_short.feature_importances_
+            
+            if imp_long is not None and imp_short is not None:
+                importances = (imp_long + imp_short) / 2.0
+            elif imp_long is not None:
+                importances = imp_long
+            elif imp_short is not None:
+                importances = imp_short
+            else:
+                return {}
+        else:
+            clf = self.classifier
+            if clf is None:
+                return {}
+            if hasattr(clf, "estimator"):
+                importances = clf.estimator.feature_importances_
+            elif hasattr(clf, "feature_importances_"):
+                importances = clf.feature_importances_
+            else:
+                return {}
+            
         return dict(sorted(
             zip(self.feature_names, importances),
             key=lambda x: x[1], reverse=True
@@ -888,12 +1047,23 @@ class MLFilter:
             "quality_model": getattr(self, "quality_model", None),
             "trend_regime_idx": getattr(self, "trend_regime_idx", -1),
             "version": getattr(self, "version", "v2"),
+            # V4 direction ensemble fields
+            "classifier_long": getattr(self, "classifier_long", None),
+            "classifier_short": getattr(self, "classifier_short", None),
+            "sl_regressor_long": getattr(self, "sl_regressor_long", None),
+            "sl_regressor_short": getattr(self, "sl_regressor_short", None),
+            "tp_regressor_long": getattr(self, "tp_regressor_long", None),
+            "tp_regressor_short": getattr(self, "tp_regressor_short", None),
+            "scaler_long": getattr(self, "scaler_long", None),
+            "scaler_short": getattr(self, "scaler_short", None),
+            "confidence_threshold_long": getattr(self, "confidence_threshold_long", self.confidence_threshold),
+            "confidence_threshold_short": getattr(self, "confidence_threshold_short", self.confidence_threshold),
         }
         with open(filepath, "wb") as f:
             pickle.dump(data, f)
 
     def load(self, filepath="ml_filter.pkl"):
-        """Load trained models from disk. Supports V3 regime ensemble, V2 XGBoost, and sklearn formats."""
+        """Load trained models from disk. Supports V4, V3 regime ensemble, V2 XGBoost, and sklearn formats."""
         script_dir = os.path.dirname(os.path.abspath(__file__))
         full_path = os.path.join(script_dir, filepath) if not os.path.isabs(filepath) else filepath
         if not os.path.exists(full_path):
@@ -922,5 +1092,16 @@ class MLFilter:
         self.quality_model = data.get("quality_model")
         self.trend_regime_idx = data.get("trend_regime_idx", -1)
         self.version = data.get("version", "v2")
-        self.is_trained = self.classifier is not None
+        # V4 direction ensemble fields
+        self.classifier_long = data.get("classifier_long")
+        self.classifier_short = data.get("classifier_short")
+        self.sl_regressor_long = data.get("sl_regressor_long")
+        self.sl_regressor_short = data.get("sl_regressor_short")
+        self.tp_regressor_long = data.get("tp_regressor_long")
+        self.tp_regressor_short = data.get("tp_regressor_short")
+        self.scaler_long = data.get("scaler_long", StandardScaler())
+        self.scaler_short = data.get("scaler_short", StandardScaler())
+        self.confidence_threshold_long = data.get("confidence_threshold_long", self.confidence_threshold)
+        self.confidence_threshold_short = data.get("confidence_threshold_short", self.confidence_threshold)
+        self.is_trained = (self.classifier is not None) or (self.classifier_long is not None)
         return True
