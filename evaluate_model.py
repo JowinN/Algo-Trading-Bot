@@ -60,7 +60,7 @@ def load_production_model():
     print(f"Model loaded from: {model_path}")
     print(f"  Keys: {list(data.keys())}")
     print(f"  Model type: {type(data.get('classifier', data.get('model', 'unknown')))}")
-    if "feature_mask" in data:
+    if data.get("feature_mask") is not None:
         mask = data["feature_mask"]
         print(f"  Feature mask: {sum(mask)}/{len(mask)} features selected")
     if "feature_names" in data:

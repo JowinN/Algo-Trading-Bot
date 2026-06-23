@@ -1,4 +1,4 @@
-﻿"""
+"""
 STRATEGY V10 - 4H Momentum Continuation
 ======================================
 Catch multi-day trends. Hold 1-3 days. Fewer filters, more trades, bigger wins.
@@ -26,6 +26,8 @@ Math: 35% WR at 3.5R = PF 1.88
 """
 
 import numpy as np
+from config import Config as c
+
 
 
 class Signal:
@@ -153,12 +155,11 @@ def generate_signal(df, htf_bias=None):
 def _calculate_levels(signal, price, atr_val, df):
     """
     4H SL/TP levels:
-    SL: 2.0 ATR (wide — beyond intraday noise on 4H)
-    TP: 3.5R (7.0 ATR — multi-day target)
-
+    Uses SL_ATR_MULT and TP_ATR_MULT from Config.
     Structure-adjusted: Uses swing points when available.
     """
-    sl_dist = atr_val * 2.0
+    sl_dist = atr_val * c.SL_ATR_MULT
+    rr_ratio = c.TP_ATR_MULT / c.SL_ATR_MULT if c.SL_ATR_MULT > 0 else 1.0
 
     if signal == Signal.LONG:
         swing_low = float(df.iloc[-1]["swing_low"])
@@ -167,13 +168,15 @@ def _calculate_levels(signal, price, atr_val, df):
         if 1.2 * atr_val <= struct_dist <= 2.5 * atr_val:
             sl_dist = struct_dist + atr_val * 0.1  # Small buffer
         sl = price - sl_dist
-        tp = price + sl_dist * 3.5  # 3.5:1 R:R
+        tp = price + sl_dist * rr_ratio
     else:
         swing_high = float(df.iloc[-1]["swing_high"])
         struct_dist = swing_high - price
         if 1.2 * atr_val <= struct_dist <= 2.5 * atr_val:
             sl_dist = struct_dist + atr_val * 0.1
         sl = price + sl_dist
-        tp = price - sl_dist * 3.5  # 3.5:1 R:R
+        tp = price - sl_dist * rr_ratio
+
+    return sl, tp
 
     return sl, tp

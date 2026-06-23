@@ -16,6 +16,8 @@ import pickle
 import pandas as pd
 import os
 from sklearn.preprocessing import StandardScaler
+from config import Config as c
+
 
 try:
     import xgboost as xgb
@@ -39,10 +41,11 @@ RETRAIN_INTERVAL = 15
 CONFIDENCE_THRESHOLD = 0.15
 
 # SL/TP bounds (in ATR multiples for SL, R-multiples for TP)
-MIN_SL_ATR = 1.0
-MAX_SL_ATR = 4.0
-MIN_TP_R = 1.5
-MAX_TP_R = 6.0
+MIN_SL_ATR = min(1.0, c.SL_ATR_MULT)
+MAX_SL_ATR = max(4.0, c.SL_ATR_MULT)
+config_rr = c.TP_ATR_MULT / c.SL_ATR_MULT if c.SL_ATR_MULT > 0 else 1.0
+MIN_TP_R = min(1.5, config_rr)
+MAX_TP_R = max(6.0, config_rr)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -705,7 +708,7 @@ class MLFilter:
         Supports V3 regime ensemble and V2 single-model inference.
         """
         if not self.is_trained:
-            return True, 0.5, 2.0, 3.0
+            return True, 0.5, c.SL_ATR_MULT, config_rr
 
         feature_vals = list(features.values())
 
@@ -753,8 +756,8 @@ class MLFilter:
         should_take = prob >= self.confidence_threshold
 
         # SL/TP regression
-        suggested_sl = 2.0
-        suggested_tp = 3.0
+        suggested_sl = c.SL_ATR_MULT
+        suggested_tp = config_rr
 
         if self.sl_regressor is not None:
             suggested_sl = float(self.sl_regressor.predict(X_scaled)[0])
