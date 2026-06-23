@@ -119,7 +119,7 @@ class BacktestEngine:
         print(f"  BACKTESTING ALGO BOT v9 — 4H TREND RIDER — {self.days} DAYS")
         print(f"  Start Balance: ${self.balance:.2f}")
         print(f"  Symbols: {len(self.symbols)}")
-        print(f"  Primary: 4H | HTF: Daily | SL: 2.0 ATR | TP: 4.0R")
+        print(f"  Primary: 4H | HTF: Daily | SL: {c.SL_ATR_MULT:.1f} ATR | TP: {c.TP_ATR_MULT:.1f} ATR (R:R 1:{c.TP_ATR_MULT/c.SL_ATR_MULT:.1f})")
         print(f"{'='*70}\n")
         
         # Load 15m data for all symbols (will be resampled)

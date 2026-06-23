@@ -73,8 +73,8 @@ class Config:
 
     # ── RISK MANAGEMENT ───────────────────────────────────────────
     RISK_PER_TRADE   = 0.015      # 1.5% risk per trade (aggressive but controlled)
-    SL_ATR_MULT      = 2.0        # 2.0 ATR SL on 4H (wide, survives noise)
-    TP_ATR_MULT      = 4.0        # 3.5R target (2.0 * 3.5 = 7.0 ATR)
+    SL_ATR_MULT      = 1.0        # 1.0 ATR SL
+    TP_ATR_MULT      = 1.0        # 1.0 ATR TP (1:1 R:R)
     
     DAILY_LOSS_LIMIT = 0.08       # 8% max daily loss
     MAX_POSITIONS    = 4          # 4 concurrent (more opportunities)
