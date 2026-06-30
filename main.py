@@ -1,6 +1,8 @@
 import time
 import os
 import logging
+import socket
+import sys
 from datetime import datetime, date
 from dotenv import load_dotenv
 from mudrex import TradeClient
@@ -14,6 +16,14 @@ import json
 from collections import deque
 import requests
 from indicators import compute_all, compute_htf, compute_htf
+
+# ── SINGLE INSTANCE SOCKET LOCK ───────────────────────────────────────
+try:
+    lock_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    lock_socket.bind(("127.0.0.1", 48281))
+except socket.error:
+    print("❌ Error: Another instance of the bot is already running! Exiting.")
+    sys.exit(1)
 
 load_dotenv()
 
@@ -249,25 +259,50 @@ def round_qty(qty: float, symbol: str = None) -> float:
     import math
     return round(math.floor(qty / step) * step, 8)
 
-def open_trade(symbol: str, signal: str, price: float, sl: float, tp: float, qty: float, lev: int) -> bool:
+def open_trade(symbol: str, signal: str, price: float, sl: float, tp: float, qty: float, lev: int, rr_ratio: float = 1.0) -> bool:
     try:
         sl = round_price(sl, symbol)
         tp = round_price(tp, symbol)
         qty = round_qty(qty, symbol)
 
+        # Get step size for symbol and format quantity string
+        step = 0.1
+        if symbol and symbol in INSTRUMENT_INFO:
+            step = INSTRUMENT_INFO[symbol]["qtyStep"]
+        step_str = f"{step:.8f}".rstrip('0')
+        if '.' in step_str:
+            decimals = len(step_str.split('.')[1])
+        else:
+            decimals = 0
+        qty_str = f"{qty:.{decimals}f}"
+
         # Cap SL so it doesn't exceed liquidation distance (80% of max margin)
         max_sl_pct = (1.0 / lev) * 0.75  # 75% of margin to stay above liq price
+        sl_capped = False
         if signal == "LONG":
             min_sl = price * (1 - max_sl_pct)
             if sl < min_sl:
                 log.info(f"   📐 SL capped: {sl:.6f} → {min_sl:.6f} (lev={lev}x limit)")
                 sl = round_price(min_sl, symbol)
+                sl_capped = True
         elif signal == "SHORT":
             max_sl = price * (1 + max_sl_pct)
             if sl > max_sl:
                 log.info(f"   📐 SL capped: {sl:.6f} → {max_sl:.6f} (lev={lev}x limit)")
                 sl = round_price(max_sl, symbol)
-        log.info(f"   📐 ORDER DEBUG: {symbol} {signal} price={price} sl={sl} tp={tp} qty={qty} lev={lev}")
+                sl_capped = True
+
+        # Recalculate TP proportionally if SL was capped to maintain the desired R:R ratio
+        if sl_capped:
+            actual_sl_dist = abs(price - sl)
+            if signal == "LONG":
+                tp = price + actual_sl_dist * rr_ratio
+            elif signal == "SHORT":
+                tp = price - actual_sl_dist * rr_ratio
+            tp = round_price(tp, symbol)
+            log.info(f"   📐 TP adjusted: to {tp:.6f} (to maintain {rr_ratio:.1f}:1 R:R)")
+
+        log.info(f"   📐 ORDER DEBUG: {symbol} {signal} price={price} sl={sl} tp={tp} qty={qty_str} lev={lev}")
         # Validate SL direction
         if signal == "LONG" and sl >= price:
             log.error(f"   ⚠ INVALID: LONG SL ({sl}) >= price ({price})")
@@ -278,7 +313,7 @@ def open_trade(symbol: str, signal: str, price: float, sl: float, tp: float, qty
         resp = client.place_order(
             symbol=symbol,
             leverage=str(lev),   # ← per-symbol leverage
-            quantity=str(int(qty)),
+            quantity=qty_str,
             order_type=signal,
             trigger_type="MARKET",
             is_stoploss=True,
@@ -289,7 +324,7 @@ def open_trade(symbol: str, signal: str, price: float, sl: float, tp: float, qty
         )
         icon = "🟢" if signal == "LONG" else "🔴"
         log.info(f"{icon} [{signal}] {symbol} ORDER PLACED @ ${price:.5f}")
-        log.info(f"   Qty: {int(qty)}  |  SL: ${sl:.5f}  |  TP: ${tp:.5f}  |  Lev: {lev}x")
+        log.info(f"   Qty: {qty_str}  |  SL: ${sl:.5f}  |  TP: ${tp:.5f}  |  Lev: {lev}x")
         log.info(f"   Order ID: {resp.order_id}")
         return True
     except Exception as e:
@@ -406,13 +441,16 @@ def run():
             all_positions = []
             try:
                 resp = client.get_positions()
-                if resp is not None:
-                    raw_positions = resp if isinstance(resp, list) else getattr(resp, "result", None) or []
-                    if raw_positions:
-                        all_positions = [p for p in raw_positions if float(p.get("quantity", 0) if isinstance(p, dict) else getattr(p, "quantity", 0)) != 0]
+                if resp is None:
+                    log.warning("  Could not fetch positions (response is None) — skipping scan.")
+                    time.sleep(30)
+                    continue
+                raw_positions = resp if isinstance(resp, list) else getattr(resp, "result", None) or []
+                all_positions = [p for p in raw_positions if float(p.get("quantity", 0) if isinstance(p, dict) else getattr(p, "quantity", 0)) != 0]
             except Exception as e:
-                log.warning(f"  Could not fetch positions: {e}")
-                all_positions = []
+                log.error(f"⚠ Could not fetch positions: {e} — skipping scan.")
+                time.sleep(30)
+                continue
 
             open_count = len(all_positions)
 
@@ -546,6 +584,7 @@ def run():
                         atr_v = float(df.iloc[-1]["atr"])  # Use actual ATR from indicators
                         ml_conf = 0.5
                         ml_passed = True
+                        trade_rr = c.TP_ATR_MULT / c.SL_ATR_MULT if c.SL_ATR_MULT > 0 else 1.0
 
                         if ml_filter.is_trained:
                             try:
@@ -570,15 +609,19 @@ def run():
                                     log.info(f"         {symbol}: ❌ ML BLOCKED (conf={ml_conf:.0%} < threshold)")
                                     ml_passed = False
                                 else:
-                                    # Use ML-suggested SL/TP
-                                    sl_dist = atr_v * ml_sl_mult
-                                    if signal == Signal.LONG:
-                                        sl = price - sl_dist
-                                        tp = price + sl_dist * ml_tp_r
+                                    if c.USE_ML_DYNAMIC_SL_TP:
+                                        # Use ML-suggested SL/TP
+                                        sl_dist = atr_v * ml_sl_mult
+                                        if signal == Signal.LONG:
+                                            sl = price - sl_dist
+                                            tp = price + sl_dist * ml_tp_r
+                                        else:
+                                            sl = price + sl_dist
+                                            tp = price - sl_dist * ml_tp_r
+                                        trade_rr = ml_tp_r
+                                        log.info(f"         {symbol}: ✅ ML PASS (conf={ml_conf:.0%}) SL={ml_sl_mult:.1f}ATR TP={ml_tp_r:.1f}R")
                                     else:
-                                        sl = price + sl_dist
-                                        tp = price - sl_dist * ml_tp_r
-                                    log.info(f"         {symbol}: ✅ ML PASS (conf={ml_conf:.0%}) SL={ml_sl_mult:.1f}ATR TP={ml_tp_r:.1f}R")
+                                        log.info(f"         {symbol}: ✅ ML PASS (conf={ml_conf:.0%}) [Using Strategy SL/TP]")
                             except Exception as e:
                                 log.warning(f"         {symbol}: ML error ({e}) — using strategy SL/TP")
 
@@ -588,7 +631,7 @@ def run():
                         qty = position_size(balance, price, sl, symbol)
                         if qty > 0:
                             lev    = c.SYMBOL_LEVERAGE.get(symbol, c.LEVERAGE)
-                            opened = open_trade(symbol, signal, price, sl, tp, qty, lev)
+                            opened = open_trade(symbol, signal, price, sl, tp, qty, lev, trade_rr)
                             if opened:
                                 trades_opened += 1
                                 prev_balance = balance
