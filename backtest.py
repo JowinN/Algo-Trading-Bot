@@ -415,8 +415,8 @@ class BacktestEngine:
                                     continue
                                 ml_passed += 1
                                 
-                                # Use ML-predicted SL/TP if model is trained
-                                if ml_filter.is_trained:
+                                # Use ML-predicted SL/TP if model is trained and configured
+                                if ml_filter.is_trained and c.USE_ML_DYNAMIC_SL_TP:
                                     sl_dist = entry_atr * ml_sl_mult
                                     if signal == Signal.LONG:
                                         sl = entry_price - sl_dist
