@@ -276,8 +276,9 @@ def api_logs():
         return jsonify({"lines": [l.rstrip() for l in lines]})
     except FileNotFoundError:
         return jsonify({"lines": ["⚠ bot.log not found"]})
-    except Exception as e:
-        return jsonify({"lines": [f"⚠ Error reading log: {e}"]})
+    except Exception:
+        app.logger.exception("Error reading bot.log in /api/logs")
+        return jsonify({"lines": ["⚠ Error reading log"]})
 
 HTML = """
 <!DOCTYPE html>
